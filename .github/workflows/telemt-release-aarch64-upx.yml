@@ -111,7 +111,7 @@ jobs:
           #!/bin/sh
           echo ""
           echo "================================================================="
-          echo " Installed Headless Telemt version \${PKG_VER}"
+          echo " Installed Headless Telemt version ${PKG_VER}"
           echo " Daemon configuration: /etc/config/telemt"
           echo " "
           echo " To manage via WebUI, install: "
@@ -129,14 +129,14 @@ jobs:
           # 1. Build IPKs (with mtime fix for legacy opkg compatibility)
           # ------------------------------------------------------------------
           export SOURCE_DATE_EPOCH=1704067200
-          for ARCH in "\${ARCHS[@]}"; do
-            export PKG_ARCH=\$ARCH
-            echo "Building IPK for \$PKG_ARCH..."
+          for ARCH in "${ARCHS[@]}"; do
+            export PKG_ARCH=$ARCH
+            echo "Building IPK for $PKG_ARCH..."
             cat > nfpm_ipk.yaml <<EOF
           name: telemt
-          arch: \$PKG_ARCH
+          arch: $PKG_ARCH
           platform: linux
-          version: \$PKG_VER
+          version: $PKG_VER
           maintainer: Telemt Team
           description: Headless Telemt MTProxy (Core + Init Scripts)
           contents:
@@ -159,21 +159,21 @@ jobs:
           scripts:
             postinstall: ./postinst.sh
           EOF
-            nfpm pkg --config nfpm_ipk.yaml --packager ipk --target "telemt_\${PKG_VER}_\${PKG_ARCH}.ipk"
+            nfpm pkg --config nfpm_ipk.yaml --packager ipk --target "telemt_${PKG_VER}_${PKG_ARCH}.ipk"
           done
 
           # ------------------------------------------------------------------
           # 2. Build APKs (Native format for OpenWrt 24.10+)
           # ------------------------------------------------------------------
           unset SOURCE_DATE_EPOCH
-          for ARCH in "\${ARCHS[@]}"; do
-            export PKG_ARCH=\$ARCH
-            echo "Building APK for \$PKG_ARCH..."
+          for ARCH in "${ARCHS[@]}"; do
+            export PKG_ARCH=$ARCH
+            echo "Building APK for $PKG_ARCH..."
             cat > nfpm_apk.yaml <<EOF
           name: telemt
-          arch: \$PKG_ARCH
+          arch: $PKG_ARCH
           platform: linux
-          version: \$PKG_VER
+          version: $PKG_VER
           maintainer: Telemt Team
           description: Headless Telemt MTProxy (Core + Init Scripts)
           contents:
@@ -193,7 +193,7 @@ jobs:
           scripts:
             postinstall: ./postinst.sh
           EOF
-            nfpm pkg --config nfpm_apk.yaml --packager apk --target "telemt_\${PKG_VER}_\${PKG_ARCH}.apk"
+            nfpm pkg --config nfpm_apk.yaml --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
           done
 
       - name: Create GitHub Release

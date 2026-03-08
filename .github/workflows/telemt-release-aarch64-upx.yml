@@ -114,7 +114,7 @@ jobs:
           echo "================================================================="
           echo " Installed Headless Telemt version ${PKG_VER}"
           echo " "
-          echo " To manage via WebUI, install: "
+          echo " To manage via LuCI WebUI, install: "
           echo " https://github.com/Medvedolog/luci-app-telemt"
           echo " "
           echo " To manage headless via Telegram Bot, install: "

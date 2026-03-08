@@ -110,8 +110,15 @@ jobs:
           # === 1. POST-INSTALL SCRIPT (postinst.sh) ===
           cat > postinst.sh <<EOF
           #!/bin/sh
+          echo ""
           echo "================================================================="
           echo " Installed Headless Telemt version ${PKG_VER}"
+          echo " "
+          echo " To manage via WebUI, install: "
+          echo " https://github.com/Medvedolog/luci-app-telemt"
+          echo " "
+          echo " To manage headless via Telegram Bot, install: "
+          echo " https://github.com/Medvedolog/telemt-bot"
           echo "================================================================="
           
           # Protection against old standalone installations
@@ -132,7 +139,7 @@ jobs:
           exit 0
           EOF
           chmod 755 postinst.sh
-
+          
           # === 2. PRE-REMOVE SCRIPT (prerm.sh) ===
           cat > prerm.sh <<EOF
           #!/bin/sh

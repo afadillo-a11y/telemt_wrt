@@ -5,6 +5,7 @@
 #   - Rust cross-compilation (aarch64-unknown-linux-musl)
 #   - Aggressive Cargo Profile optimizations (z, LTO, abort, strip)
 #   - UPX binary compression (LZMA)
+#   - Binary version string injection with explicit newlines for WebUI parsing
 #   - nFPM bundling: binary + /etc/init.d/telemt + /etc/config/telemt
 #   - IPK Build WITH mtime fix (0x78 avoidance for older opkg)
 #   - APK Build native OpenWrt 25+
@@ -44,11 +45,11 @@ jobs:
             echo "VERSION=nightly" >> $GITHUB_ENV
           fi
 
-      # 1. Скачиваем текущий репозиторий (где лежат files/telemt.init и files/telemt.config)
+      # 1. Checkout local repository (where files/telemt.init and files/telemt.config reside)
       - name: Checkout local repository
         uses: actions/checkout@v4
 
-      # 2. Скачиваем исходники Rust-бинарника в подпапку upstream_src
+      # 2. Checkout upstream Rust source into a subdirectory
       - name: Checkout upstream repository (Telemt source)
         uses: actions/checkout@v4
         with:
@@ -73,9 +74,10 @@ jobs:
 
       - name: Build binary with cross
         run: |
-          # Переходим в папку с исходниками Rust
+          # Switch to Rust source directory
           cd upstream_src
           
+          # Max size optimizations
           export CARGO_PROFILE_RELEASE_OPT_LEVEL=z
           export CARGO_PROFILE_RELEASE_LTO=true
           export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
@@ -93,8 +95,10 @@ jobs:
 
       - name: Append version string & Move binary
         run: |
-          echo -n "MTProxy v${{ env.VERSION }}" >> upstream_src/target/aarch64-unknown-linux-musl/release/telemt
-          # Перемещаем готовый бинарник в корень для упаковки
+          # Append with explicit newlines to ensure grep matches it correctly at the end of the binary
+          printf "\nMTProxy v%s\n" "${{ env.VERSION }}" >> upstream_src/target/aarch64-unknown-linux-musl/release/telemt
+          
+          # Move the ready binary to the root workspace for packaging
           mv upstream_src/target/aarch64-unknown-linux-musl/release/telemt telemt-aarch64-musl
 
       - name: Build IPK and APK packages with nFPM
@@ -102,14 +106,19 @@ jobs:
           export PKG_VER="${{ env.VERSION }}"
           ARCHS=("aarch64_generic" "aarch64_cortex-a53")
           
-          # Скрипт post-install (сразу включаем службу в автозагрузку)
+          # Create post-install script (enable service on boot and print UI/Bot info)
           cat > postinst.sh <<EOF
           #!/bin/sh
           echo ""
           echo "================================================================="
           echo " Installed Headless Telemt version \${PKG_VER}"
           echo " Daemon configuration: /etc/config/telemt"
-          echo " To manage via WebUI, install: luci-app-telemt"
+          echo " "
+          echo " To manage via WebUI, install: "
+          echo " https://github.com/Medvedolog/luci-app-telemt"
+          echo " "
+          echo " To manage headless via Telegram Bot, install: "
+          echo " https://github.com/Medvedolog/telemt-bot"
           echo "================================================================="
           /etc/init.d/telemt enable
           exit 0
@@ -117,17 +126,17 @@ jobs:
           chmod 755 postinst.sh
 
           # ------------------------------------------------------------------
-          # 1. Build IPKs
+          # 1. Build IPKs (with mtime fix for legacy opkg compatibility)
           # ------------------------------------------------------------------
           export SOURCE_DATE_EPOCH=1704067200
-          for ARCH in "${ARCHS[@]}"; do
-            export PKG_ARCH=$ARCH
-            echo "Building IPK for $PKG_ARCH..."
+          for ARCH in "\${ARCHS[@]}"; do
+            export PKG_ARCH=\$ARCH
+            echo "Building IPK for \$PKG_ARCH..."
             cat > nfpm_ipk.yaml <<EOF
           name: telemt
-          arch: $PKG_ARCH
+          arch: \$PKG_ARCH
           platform: linux
-          version: $PKG_VER
+          version: \$PKG_VER
           maintainer: Telemt Team
           description: Headless Telemt MTProxy (Core + Init Scripts)
           contents:
@@ -150,21 +159,21 @@ jobs:
           scripts:
             postinstall: ./postinst.sh
           EOF
-            nfpm pkg --config nfpm_ipk.yaml --packager ipk --target "telemt_${PKG_VER}_${PKG_ARCH}.ipk"
+            nfpm pkg --config nfpm_ipk.yaml --packager ipk --target "telemt_\${PKG_VER}_\${PKG_ARCH}.ipk"
           done
 
           # ------------------------------------------------------------------
-          # 2. Build APKs
+          # 2. Build APKs (Native format for OpenWrt 24.10+)
           # ------------------------------------------------------------------
           unset SOURCE_DATE_EPOCH
-          for ARCH in "${ARCHS[@]}"; do
-            export PKG_ARCH=$ARCH
-            echo "Building APK for $PKG_ARCH..."
+          for ARCH in "\${ARCHS[@]}"; do
+            export PKG_ARCH=\$ARCH
+            echo "Building APK for \$PKG_ARCH..."
             cat > nfpm_apk.yaml <<EOF
           name: telemt
-          arch: $PKG_ARCH
+          arch: \$PKG_ARCH
           platform: linux
-          version: $PKG_VER
+          version: \$PKG_VER
           maintainer: Telemt Team
           description: Headless Telemt MTProxy (Core + Init Scripts)
           contents:
@@ -184,7 +193,7 @@ jobs:
           scripts:
             postinstall: ./postinst.sh
           EOF
-            nfpm pkg --config nfpm_apk.yaml --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
+            nfpm pkg --config nfpm_apk.yaml --packager apk --target "telemt_\${PKG_VER}_\${PKG_ARCH}.apk"
           done
 
       - name: Create GitHub Release

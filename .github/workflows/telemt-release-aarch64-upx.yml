@@ -109,7 +109,7 @@ jobs:
           if pidof telemt >/dev/null 2>&1; then killall -9 telemt 2>/dev/null || true; fi
           if [ -d "/etc/telemt" ]; then mv /etc/telemt /etc/telemt.disabled_by_luci 2>/dev/null || true; fi
 
-          local old_metrics=\$(uci -q get telemt.general.metrics_port)
+          old_metrics=\$(uci -q get telemt.general.metrics_port)
           if [ "\$old_metrics" = "9091" ] || [ "\$old_metrics" = "9090" ]; then
               uci set telemt.general.metrics_port='9092'
               uci set telemt.general.api_port='9091'

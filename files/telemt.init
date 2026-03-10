@@ -1,8 +1,7 @@
 #!/bin/sh /etc/rc.common
 # ==============================================================================
 # Telemt MTProxy Service Management Script
-# Version: 3.3.10 LTS
-# Requires: telemt core binary >= 3.3.3
+# Version: 3.3.15-3 (API v1, Hot-Reload, Smart Whitelists, Targeted Kill, CPU-Opt)
 # ==============================================================================
 START=99
 STOP=10
@@ -13,8 +12,13 @@ extra_command "run_save_stats" "Force dump prometheus metrics to RAM before shut
 
 PROG="$(command -v telemt 2>/dev/null || echo /usr/bin/telemt)"
 
+# Check if string is a valid CIDR
 is_cidr() { case "$1" in *[!0-9A-Fa-f:./]* ) return 1 ;; esac; echo "$1" | grep -qE '^[0-9A-Fa-f:.]+/[0-9]{1,3}$'; }
+
+# Check if string is an unsigned integer
 is_uint() { echo "$1" | grep -qE '^[0-9]+$'; }
+
+# Escape special characters for TOML string injection
 sanitize_toml_value() { printf '%s' "$1" | tr -d '\n\r' | sed 's/["\\]/\\&/g'; }
 
 fetch_metrics() {
@@ -31,19 +35,26 @@ run_save_stats() {
     local tmp_stat=$(mktemp /tmp/telemt_stats.XXXXXX)
     trap 'rm -f "$tmp_live" "$tmp_stat"' EXIT INT TERM
     
-    local pid=$(pidof telemt 2>/dev/null | awk '{print $1}')
+    # Targeted check for core proxy PID only
+    local pid=""
+    for p in $(pidof telemt 2>/dev/null); do
+        if [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "telemt" ]; then pid="$p"; break; fi
+    done
     if [ -z "$pid" ]; then return 0; fi
     
+    # Fetch live metrics from local endpoint
     local raw=$(fetch_metrics "http://127.0.0.1:${m_port}/metrics" 2>/dev/null)
     if [ -z "$raw" ]; then return 0; fi
     touch "$tmp_file" 2>/dev/null
     
+    # Parse TX/RX stats per user
     echo "$raw" | awk '
     /^telemt_user_octets_to_client/ { match($0, /user="[^"]+"/); if(RSTART) { u=substr($0, RSTART+6, RLENGTH-7); tx[u]+=$2; users[u]=1 } }
     /^telemt_user_octets_from_client/ { match($0, /user="[^"]+"/); if(RSTART) { u=substr($0, RSTART+6, RLENGTH-7); rx[u]+=$2; users[u]=1 } }
     END { for(u in users) printf "%s %.0f %.0f\n", u, tx[u], rx[u] }
     ' > "$tmp_live"
 
+    # Merge live stats with previously accumulated stats
     if [ -s "$tmp_live" ]; then
         cat "$tmp_live" "$tmp_file" 2>/dev/null | awk '
         NF==3 { tx[$1] += $2; rx[$1] += $3; users[$1]=1 }
@@ -56,13 +67,11 @@ run_save_stats() {
 generate_toml() {
     local target_file="$1"
     
-    local enabled mode port api_port metrics_port m_alo m_alan metrics_whitelist domain log_level use_mp stun_use ad_tag announce_ip external_ip
+    local enabled mode port api_port metrics_port m_alo m_alan metrics_whitelist domain log_level use_mp use_stun ad_tag announce_ip external_ip
     local tm_handshake tm_connect tm_keepalive tm_ack listen_ipv4 listen_ipv6 prefer_ip fake_cert_len tls_full_cert_ttl_secs replay_window_secs ignore_time_skew
-    local desync_all mask_proxy_protocol minimal_rt api_enabled
+    local me_pool_size me_warm_standby hardswap me_drain_ttl auto_deg deg_min_dc desync_all mask_proxy_protocol minimal_rt
     
-    # 3.3.10 LTS ME Pool & Tuning
-    local me_pool_size hardswap me_drain_ttl update_every me_reinit_every_secs me_pool_min_fresh_ratio proxy_secret_rotate_runtime
-    local stun_nat_probe_concurrency me_reconnect_max_concurrent_per_dc me_reinit_drain_timeout_secs me_one_retry me_one_timeout_ms
+    # Adaptive ME parameters
     local me_floor_mode me_idle_secs me_grace_secs me_min_single me_shadow_writers me_outage_mode me_outage_no_quarantine me_shadow_rotate
     
     local TMP_LINKS=$(mktemp /tmp/telemt_links.XXXXXX)
@@ -76,16 +85,20 @@ generate_toml() {
     trap 'rm -f "$TMP_LINKS" "$TMP_USERS" "$TMP_CONNS" "$TMP_IPS" "$TMP_QUOTA" "$TMP_EXP" "$TMP_CONF"' EXIT INT TERM
     
     config_get mode general mode "tls"
-    config_get port general port "4443"
+    config_get port general port "443"
     config_get metrics_port general metrics_port "9092"
     config_get api_port general api_port "9091"
     
+    # Safety Check: Prevent port conflicts
     if [ "$metrics_port" -eq "$api_port" ]; then
         api_port=$((metrics_port + 1))
         logger -t telemt "Init: Port conflict detected. Auto-shifted Control API to $api_port"
     fi
+    if [ "$port" -eq "$api_port" ] || [ "$port" -eq "$metrics_port" ]; then
+        logger -t telemt "Init: CRITICAL ERROR! Proxy port conflicts with API/Metrics. Aborting."
+        return 1
+    fi
     
-    config_get_bool api_enabled general api_enabled 1
     config_get_bool m_alo general metrics_allow_lo 1
     config_get_bool m_alan general metrics_allow_lan 1
     config_get metrics_whitelist general metrics_whitelist ""
@@ -101,21 +114,15 @@ generate_toml() {
     config_get tm_ack general tm_ack "300"
     
     config_get_bool use_mp general use_middle_proxy 0
-    config_get_bool stun_use general use_stun 1
-    
-    config_get update_every general update_every "300"
+    config_get_bool use_stun general use_stun 0
     config_get me_pool_size general me_pool_size "16"
+    config_get me_warm_standby general me_warm_standby "8"
     config_get_bool hardswap general hardswap 1
     config_get me_drain_ttl general me_drain_ttl "90"
-    config_get me_reinit_every_secs general me_reinit_every_secs "900"
-    config_get me_pool_min_fresh_ratio general me_pool_min_fresh_ratio "0.8"
-    config_get_bool proxy_secret_rotate_runtime general proxy_secret_rotate_runtime 1
-    config_get me_reconnect_max_concurrent_per_dc general me_reconnect_max_concurrent_per_dc "8"
-    config_get me_reinit_drain_timeout_secs general me_reinit_drain_timeout_secs "120"
-    config_get stun_nat_probe_concurrency general stun_nat_probe_concurrency "8"
-    config_get me_one_retry general me_one_retry "12"
-    config_get me_one_timeout_ms general me_one_timeout_ms "1200"
+    config_get_bool auto_deg general auto_degradation 1
+    config_get deg_min_dc general degradation_min_dc "2"
     
+    # ME Adaptive tuning parameters mapping
     config_get me_floor_mode general me_floor_mode "static"
     config_get me_idle_secs general me_adaptive_floor_idle_secs "600"
     config_get me_grace_secs general me_adaptive_floor_recover_grace_secs "120"
@@ -129,7 +136,7 @@ generate_toml() {
     config_get ad_tag general ad_tag ""
     config_get announce_ip general announce_ip ""
     config_get fake_cert_len general fake_cert_len "2048"
-    config_get tls_full_cert_ttl_secs general tls_full_cert_ttl_secs "90"
+    config_get tls_full_cert_ttl_secs general tls_full_cert_ttl_secs "0"
     config_get replay_window_secs general replay_window_secs "1800"
     config_get_bool ignore_time_skew general ignore_time_skew 0
     config_get mask_proxy_protocol general mask_proxy_protocol "0"
@@ -141,18 +148,19 @@ generate_toml() {
     if [ -n "$external_ip" ]; then external_ip=$(echo "$external_ip" | awk '{print $1}'); fi
     if [ -z "$announce_ip" ] && [ -n "$external_ip" ]; then announce_ip="$external_ip"; fi
     
-    local api_str="false"; [ "$api_enabled" -eq 1 ] && api_str="true"
     local mp_str="false"; [ "$use_mp" -eq 1 ] && mp_str="true"
-    local stun_str="false"; [ "$stun_use" -eq 1 ] && stun_str="true"
+    local stun_str="false"; [ "$use_stun" -eq 1 ] && stun_str="true"
     local v4_str="false"; [ "$listen_ipv4" -eq 1 ] && v4_str="true"
     local v6_str="false"; [ "$listen_ipv6" -eq 1 ] && v6_str="true"
     local time_skew_str="false"; [ "$ignore_time_skew" -eq 1 ] && time_skew_str="true"
     local hardswap_str="false"; [ "$hardswap" -eq 1 ] && hardswap_str="true"
+    local auto_deg_str="false"; [ "$auto_deg" -eq 1 ] && auto_deg_str="true"
     local minimal_rt_str="false"; [ "$minimal_rt" -eq 1 ] && minimal_rt_str="true"
-    local m_cls="false"; local m_sec="false"; local m_tls="false"
     
+    local m_cls="false"; local m_sec="false"; local m_tls="false"
     case "$mode" in "classic") m_cls="true" ;; "dd") m_sec="true" ;; "all") m_cls="true"; m_sec="true"; m_tls="true" ;; *) m_tls="true" ;; esac
 
+    # CIDR Whitelist generation for Metrics and API
     local wl_toml=""
     [ "$m_alo" -eq 1 ] && wl_toml="\"127.0.0.1/32\", \"::1/128\""
     
@@ -185,43 +193,40 @@ generate_toml() {
         fi
     done
 
+    # ================= CORE CONFIGURATION (REQUIRES RESTART ON CHANGE) =================
     cat <<TOML > "$TMP_CONF"
 [network]
 ipv4 = $v4_str
 ipv6 = $v6_str
 prefer = $prefer_ip
-stun_use = $stun_str
-stun_tcp_fallback = true
+# Active probing servers for ME
 stun_servers = [
   "stun.l.google.com:5349",
   "stun1.l.google.com:3478",
   "stun.l.google.com:19302",
   "stun1.l.google.com:19302"
 ]
-http_ip_detect_urls = [
-  "https://api.ipify.org",
-  "https://ifconfig.me/ip"
-]
+stun_tcp_fallback = true
 
 [general]
 fast_mode = true
 use_middle_proxy = $mp_str
 log_level = "$log_level"
-update_every = $update_every
 TOML
 
     if [ "$use_mp" -eq 1 ]; then
+        # Global fallback Ad Tag for non-commercial routing
+        [ -n "$ad_tag" ] && echo "ad_tag = \"$ad_tag\"" >> "$TMP_CONF"
         cat <<TOML >> "$TMP_CONF"
+middle_proxy_nat_probe = $stun_str
 middle_proxy_pool_size = $me_pool_size
+middle_proxy_warm_standby = $me_warm_standby
 hardswap = $hardswap_str
 me_pool_drain_ttl_secs = $me_drain_ttl
-me_reinit_every_secs = $me_reinit_every_secs
-me_pool_min_fresh_ratio = $me_pool_min_fresh_ratio
-proxy_secret_rotate_runtime = $( [ "$proxy_secret_rotate_runtime" -eq 1 ] && echo "true" || echo "false" )
-me_reconnect_max_concurrent_per_dc = $me_reconnect_max_concurrent_per_dc
-me_reinit_drain_timeout_secs = $me_reinit_drain_timeout_secs
-stun_nat_probe_concurrency = $stun_nat_probe_concurrency
+auto_degradation_enabled = $auto_deg_str
+degradation_min_unavailable_dc_groups = $deg_min_dc
 
+# Adaptive ME settings mapped from UCI
 floor_mode = "$me_floor_mode"
 adaptive_floor_idle_secs = $me_idle_secs
 adaptive_floor_recover_grace_secs = $me_grace_secs
@@ -235,7 +240,6 @@ TOML
     fi
 
     if [ "$desync_all" -eq 1 ]; then echo "desync_all_full = true" >> "$TMP_CONF"; fi
-    [ -n "$ad_tag" ] && echo "ad_tag = \"$ad_tag\"" >> "$TMP_CONF"
 
     mkdir -p /var/etc/telemt_tlsfront
 
@@ -252,15 +256,25 @@ metrics_port = $metrics_port
 metrics_whitelist = [$wl_toml]
 TOML
 
-    if [ "$listen_ipv4" -eq 1 ]; then printf '\n[[server.listeners]]\nip = "0.0.0.0"\n' >> "$TMP_CONF"; fi
-    if [ "$listen_ipv6" -eq 1 ]; then printf '\n[[server.listeners]]\nip = "::"\n' >> "$TMP_CONF"; fi
+    # Configure Listener Array dynamically based on ipv4/ipv6 flags and announce_ip
+    if [ "$listen_ipv4" -eq 1 ]; then
+        echo "[[server.listeners]]" >> "$TMP_CONF"
+        echo "ip = \"0.0.0.0\"" >> "$TMP_CONF"
+        if [ -n "$announce_ip" ]; then echo "announce = \"$announce_ip\"" >> "$TMP_CONF"; fi
+    fi
+    
+    if [ "$listen_ipv6" -eq 1 ]; then
+        echo "[[server.listeners]]" >> "$TMP_CONF"
+        echo "ip = \"::\"" >> "$TMP_CONF"
+        if [ -n "$announce_ip" ]; then echo "announce = \"$announce_ip\"" >> "$TMP_CONF"; fi
+    fi
 
     cat <<TOML >> "$TMP_CONF"
 
 [server.api]
-enabled = $api_str
-listen = "127.0.0.1:${api_port}"
-whitelist = ["127.0.0.1/32", "::1/128"]
+enabled = true
+listen = "0.0.0.0:${api_port}"
+whitelist = [$wl_toml]
 minimal_runtime_enabled = $minimal_rt_str
 minimal_runtime_cache_ttl_ms = 1000
 
@@ -269,14 +283,13 @@ client_handshake = $tm_handshake
 tg_connect = $tm_connect
 client_keepalive = $tm_keepalive
 client_ack = $tm_ack
-me_one_retry = $me_one_retry
-me_one_timeout_ms = $me_one_timeout_ms
 
 [censorship]
 tls_domain = "$domain"
 mask = true
 mask_port = 443
 mask_proxy_protocol = $mask_proxy_protocol
+# Critical for anti-censorship
 tls_emulation = true
 tls_front_dir = "/var/etc/telemt_tlsfront"
 fake_cert_len = $fake_cert_len
@@ -286,55 +299,10 @@ tls_full_cert_ttl_secs = $tls_full_cert_ttl_secs
 replay_check_len = 65536
 replay_window_secs = $replay_window_secs
 ignore_time_skew = $time_skew_str
+
+# --- DYNAMIC CONFIG ---
 TOML
-
-    local master_up
-    config_get_bool master_up general enable_upstreams 1
-
-    local has_upstreams=0
-    handle_upstream() {
-        if [ "$master_up" -eq 0 ]; then return; fi
-        
-        local s="$1"
-        local u_en u_type u_addr u_user u_pass u_weight u_iface u_scopes
-        config_get_bool u_en "$s" enabled 0
-        [ "$u_en" -ne 1 ] && return
-        
-        config_get u_type "$s" type "direct"
-        config_get u_weight "$s" weight "10"
-        config_get u_iface "$s" interface ""
-        config_get u_scopes "$s" scopes ""
-        
-        if [ "$u_type" != "direct" ]; then
-            config_get u_addr "$s" address ""
-            if [ -z "$u_addr" ]; then return; fi
-        fi
-
-        printf '\n[[upstreams]]\n' >> "$TMP_CONF"
-        echo "type = \"$u_type\"" >> "$TMP_CONF"
-        echo "weight = $u_weight" >> "$TMP_CONF"
-        echo "enabled = true" >> "$TMP_CONF"
-        
-        [ -n "$u_scopes" ] && echo "scopes = \"$(sanitize_toml_value "$u_scopes")\"" >> "$TMP_CONF"
-        [ -n "$u_iface" ] && echo "interface = \"$(sanitize_toml_value "$u_iface")\"" >> "$TMP_CONF"
-        
-        if [ "$u_type" != "direct" ]; then
-            config_get u_user "$s" username ""
-            config_get u_pass "$s" password ""
-            echo "address = \"$(sanitize_toml_value "$u_addr")\"" >> "$TMP_CONF"
-            [ -n "$u_user" ] && echo "username = \"$(sanitize_toml_value "$u_user")\"" >> "$TMP_CONF"
-            [ -n "$u_pass" ] && echo "password = \"$(sanitize_toml_value "$u_pass")\"" >> "$TMP_CONF"
-        fi
-        has_upstreams=1
-    }
-    config_foreach handle_upstream upstream
-
-    if [ "$has_upstreams" -eq 0 ]; then
-        printf '\n[[upstreams]]\ntype = "direct"\nenabled = true\nweight = 10\n' >> "$TMP_CONF"
-    fi
-
-    echo "" >> "$TMP_CONF"
-    echo "# --- DYNAMIC CONFIG ---" >> "$TMP_CONF"
+    # ================= DYNAMIC CONFIGURATION (HOT-RELOADABLE) =================
 
     is_user_enabled() { local en; config_get_bool en "$1" enabled 1; [ "$en" -eq 1 ]; }
     add_user_link() { is_user_enabled "$1" || return 0; printf '"%s", ' "$1" >> "$TMP_LINKS"; }
@@ -348,6 +316,7 @@ TOML
     local links_str=""; [ -s "$TMP_LINKS" ] && links_str=$(sed 's/, $//' "$TMP_LINKS")
     printf '\n[general.links]\nshow = [%s]\n' "$links_str" >> "$TMP_CONF"
     
+    # Global Announce IP mapped to public_host for proper link generation
     if [ -n "$announce_ip" ]; then printf 'public_host = "%s"\n' "$announce_ip" >> "$TMP_CONF"; fi
 
     printf '\n[access.users]\n' >> "$TMP_CONF"
@@ -366,6 +335,42 @@ TOML
     config_foreach add_user_expiration user
     if [ -s "$TMP_EXP" ]; then printf '\n[access.user_expirations]\n' >> "$TMP_CONF"; cat "$TMP_EXP" >> "$TMP_CONF"; fi
     
+    local has_upstreams=0
+    handle_upstream() {
+        local s="$1"
+        local u_en u_type u_addr u_user u_pass u_weight
+        config_get_bool u_en "$s" enabled 0
+        [ "$u_en" -ne 1 ] && return
+        
+        config_get u_type "$s" type "direct"
+        config_get u_weight "$s" weight "10"
+        
+        # SAFETY FIX: Ignore SOCKS upstreams with empty addresses to prevent backend crash
+        if [ "$u_type" != "direct" ]; then
+            config_get u_addr "$s" address ""
+            if [ -z "$u_addr" ]; then return; fi
+        fi
+
+        printf '\n[[upstreams]]\n' >> "$TMP_CONF"
+        echo "type = \"$u_type\"" >> "$TMP_CONF"
+        echo "weight = $u_weight" >> "$TMP_CONF"
+        echo "enabled = true" >> "$TMP_CONF"
+        
+        if [ "$u_type" != "direct" ]; then
+            config_get u_user "$s" username ""
+            config_get u_pass "$s" password ""
+            echo "address = \"$(sanitize_toml_value "$u_addr")\"" >> "$TMP_CONF"
+            [ -n "$u_user" ] && echo "username = \"$(sanitize_toml_value "$u_user")\"" >> "$TMP_CONF"
+            [ -n "$u_pass" ] && echo "password = \"$(sanitize_toml_value "$u_pass")\"" >> "$TMP_CONF"
+        fi
+        has_upstreams=1
+    }
+    config_foreach handle_upstream upstream
+
+    if [ "$has_upstreams" -eq 0 ]; then
+        printf '\n[[upstreams]]\ntype = "direct"\nenabled = true\nweight = 10\n' >> "$TMP_CONF"
+    fi
+    
     mv "$TMP_CONF" "$target_file"
     rm -f "$TMP_USERS" "$TMP_CONNS" "$TMP_QUOTA" "$TMP_IPS" "$TMP_LINKS" "$TMP_EXP" "$TMP_CONF"
     trap - EXIT INT TERM
@@ -381,21 +386,17 @@ start_service() {
 
     if [ -x "$PROG" ]; then
         mkdir -p /var/etc
-        if [ ! -s /var/etc/telemt.version ]; then
-            local ver=$(tail -c 256 "$PROG" 2>/dev/null | grep -a -oE 'MTProxy v[0-9]+\.[0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-            if [ -n "$ver" ]; then 
-                echo "$ver" > /var/etc/telemt.version
-                chmod 644 /var/etc/telemt.version
-            fi
-        fi
+        # ОПТИМИЗАЦИЯ: Читаем только последние 128 байт файла (0% нагрузки на CPU)
+        local ver=$(tail -c 128 "$PROG" 2>/dev/null | grep -a -i 'MTProxy v' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+        if [ -n "$ver" ]; then echo "$ver" > /var/etc/telemt.version; chmod 644 /var/etc/telemt.version; fi
     fi
 
     generate_toml "$CONF"
     chmod 600 "$CONF"
     
     local port auto_fw
-    config_get port general port "4443"
-    config_get_bool auto_fw general auto_fw 0
+    config_get port general port "443"
+    config_get_bool auto_fw general auto_fw 1
     
     procd_open_instance
     procd_set_param command "$PROG" "$CONF"
@@ -437,15 +438,18 @@ reload_service() {
     generate_toml "$NEW_CONF"
     chmod 600 "$NEW_CONF"
     
+    # Safe Diff: Check if core settings changed (above the DYNAMIC CONFIG marker)
     sed -n '1,/^# --- DYNAMIC CONFIG ---/p' "$CONF" 2>/dev/null > /tmp/telemt_core.old
     sed -n '1,/^# --- DYNAMIC CONFIG ---/p' "$NEW_CONF" > /tmp/telemt_core.new
     
     if cmp -s /tmp/telemt_core.old /tmp/telemt_core.new; then
+        # Core did not change. Replace file silently for hot-reload.
         mv "$NEW_CONF" "$CONF"
-        logger -t telemt "WebUI: Users/Quotas updated. Executed Hot-Reload (no connections dropped)."
+        logger -t telemt "WebUI: Users/Upstreams updated. Executed Hot-Reload (no connections dropped)."
     else
+        # Core settings changed. Full daemon restart is required.
         mv "$NEW_CONF" "$CONF"
-        logger -t telemt "WebUI: Core settings or Upstreams changed. Performing hard restart of telemt."
+        logger -t telemt "WebUI: Core settings changed. Performing hard restart of telemt."
         restart
     fi
     
@@ -454,13 +458,16 @@ reload_service() {
 
 stop_service() {
     [ "$TELEMT_NO_SAVE" != "1" ] && run_save_stats
-    local t_pid=$(pidof telemt | awk '{print $1}')
-    if [ -n "$t_pid" ]; then
-        logger -t telemt "WebUI: Safely killing telemt process PID: $t_pid"
-        kill -9 "$t_pid" 2>/dev/null
-    fi
+    
+    # ХИРУРГИЧЕСКАЯ ЗАЩИТА: убиваем строго ядро telemt, защищая telemt-bot и другие процессы
+    for p in $(pidof telemt 2>/dev/null); do
+        local comm=$(cat "/proc/$p/comm" 2>/dev/null)
+        if [ "$comm" = "telemt" ]; then
+            kill -9 "$p" 2>/dev/null
+        fi
+    done
 }
 
 service_triggers() { 
-    procd_add_reload_trigger "telemt"
+    procd_add_reload_trigger "telemt";
 }

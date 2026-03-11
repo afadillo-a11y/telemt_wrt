@@ -67,9 +67,9 @@ run_save_stats() {
 generate_toml() {
     local target_file="$1"
     
-    local enabled mode port api_port metrics_port api_enabled m_alo m_alan metrics_whitelist domain log_level use_mp use_stun ad_tag announce_ip external_ip
+    local enabled mode port api_port metrics_port ext_rt m_alo m_alan metrics_whitelist domain log_level use_mp use_stun ad_tag announce_ip external_ip
     local tm_handshake tm_connect tm_keepalive tm_ack listen_ipv4 listen_ipv6 prefer_ip fake_cert_len tls_full_cert_ttl_secs replay_window_secs ignore_time_skew
-    local me_pool_size me_warm_standby hardswap me_drain_ttl auto_deg deg_min_dc desync_all mask_proxy_protocol minimal_rt
+    local me_pool_size me_warm_standby hardswap me_drain_ttl auto_deg deg_min_dc desync_all mask_proxy_protocol
     
     # Adaptive ME parameters
     local me_floor_mode me_idle_secs me_grace_secs me_min_single me_shadow_writers me_outage_mode me_outage_no_quarantine me_shadow_rotate
@@ -88,7 +88,9 @@ generate_toml() {
     config_get port general port "8433"
     config_get metrics_port general metrics_port "9092"
     config_get api_port general api_port "9091"
-    config_get_bool api_enabled general api_enabled 1
+    
+    # Unified UI flag mapping for Control API and Minimal Runtime
+    config_get_bool ext_rt general extended_runtime_enabled 1
     
     # Safety Check: Prevent port conflicts
     if [ "$metrics_port" -eq "$api_port" ]; then
@@ -141,7 +143,6 @@ generate_toml() {
     config_get replay_window_secs general replay_window_secs "1800"
     config_get_bool ignore_time_skew general ignore_time_skew 0
     config_get mask_proxy_protocol general mask_proxy_protocol "0"
-    config_get_bool minimal_rt general minimal_runtime_enabled 1
     
     domain=$(echo "$domain" | tr -cd 'A-Za-z0-9.-')
     ad_tag=$(sanitize_toml_value "$ad_tag" | tr -cd 'A-Fa-f0-9')
@@ -156,8 +157,8 @@ generate_toml() {
     local time_skew_str="false"; [ "$ignore_time_skew" -eq 1 ] && time_skew_str="true"
     local hardswap_str="false"; [ "$hardswap" -eq 1 ] && hardswap_str="true"
     local auto_deg_str="false"; [ "$auto_deg" -eq 1 ] && auto_deg_str="true"
-    local minimal_rt_str="false"; [ "$minimal_rt" -eq 1 ] && minimal_rt_str="true"
-    local api_str="false"; [ "$api_enabled" -eq 1 ] && api_str="true"
+    local api_str="false"; [ "$ext_rt" -eq 1 ] && api_str="true"
+    local minimal_rt_str="false"; [ "$ext_rt" -eq 1 ] && minimal_rt_str="true"
     
     local m_cls="false"; local m_sec="false"; local m_tls="false"
     case "$mode" in "classic") m_cls="true" ;; "dd") m_sec="true" ;; "all") m_cls="true"; m_sec="true"; m_tls="true" ;; *) m_tls="true" ;; esac
@@ -187,7 +188,8 @@ generate_toml() {
     fi
 
     for raw in $(echo "$metrics_whitelist" | tr ',' ' '); do
-        ip="$(echo "$raw" | tr -d ' \t\r\n')"; [ -z "$ip" ] && continue
+        ip="$(echo "$raw" | tr -d ' \t\r\n')"; 
+        [ -z "$ip" ] && continue
         if echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then ip="$ip/32"
         elif echo "$ip" | grep -qE '^[0-9A-Fa-f:]+$'; then ip="$ip/128"; fi
         if is_cidr "$ip"; then 
@@ -341,12 +343,14 @@ TOML
     local has_upstreams=0
     handle_upstream() {
         local s="$1"
-        local u_en u_type u_addr u_user u_pass u_weight
+        local u_en u_type u_addr u_user u_pass u_weight u_scopes u_interface
         config_get_bool u_en "$s" enabled 0
         [ "$u_en" -ne 1 ] && return
         
         config_get u_type "$s" type "direct"
         config_get u_weight "$s" weight "10"
+        config_get u_scopes "$s" scopes ""
+        config_get u_interface "$s" interface ""
         
         # SAFETY FIX: Ignore SOCKS upstreams with empty addresses to prevent backend crash
         if [ "$u_type" != "direct" ]; then
@@ -359,12 +363,16 @@ TOML
         echo "weight = $u_weight" >> "$TMP_CONF"
         echo "enabled = true" >> "$TMP_CONF"
         
+        [ -n "$u_scopes" ] && echo "scopes = \"$(sanitize_toml_value "$u_scopes")\"" >> "$TMP_CONF"
+        
         if [ "$u_type" != "direct" ]; then
             config_get u_user "$s" username ""
             config_get u_pass "$s" password ""
             echo "address = \"$(sanitize_toml_value "$u_addr")\"" >> "$TMP_CONF"
             [ -n "$u_user" ] && echo "username = \"$(sanitize_toml_value "$u_user")\"" >> "$TMP_CONF"
             [ -n "$u_pass" ] && echo "password = \"$(sanitize_toml_value "$u_pass")\"" >> "$TMP_CONF"
+        elif [ -n "$u_interface" ]; then
+            echo "interface = \"$(sanitize_toml_value "$u_interface")\"" >> "$TMP_CONF"
         fi
         has_upstreams=1
     }
@@ -408,7 +416,7 @@ start_service() {
     procd_set_param stderr 1
     procd_set_param respawn 3600 30 0
     procd_set_param limits nofile="65536 65536"
-    
+   
     if [ "$auto_fw" -eq 1 ]; then
         procd_open_data
         json_add_array firewall

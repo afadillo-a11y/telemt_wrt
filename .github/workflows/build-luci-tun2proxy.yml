@@ -787,8 +787,20 @@ jobs:
               file_info:
                 mode: 0755
 
-            - src: ./pkgroot/
-              dst: /
+            - src: ./pkgroot/etc/init.d/
+              dst: /etc/init.d
+              type: tree
+
+            - src: ./pkgroot/usr/share/luci/menu.d/
+              dst: /usr/share/luci/menu.d
+              type: tree
+
+            - src: ./pkgroot/usr/share/rpcd/acl.d/
+              dst: /usr/share/rpcd/acl.d
+              type: tree
+
+            - src: ./pkgroot/www/luci-static/resources/view/tun2proxy/
+              dst: /www/luci-static/resources/view/tun2proxy
               type: tree
 
             - src: ./pkgroot/etc/config/tun2proxy
@@ -808,7 +820,7 @@ jobs:
 
           nfpm package --config nfpm.yaml --packager ipk --target "${PKG_NAME}_${VERSION}_aarch64_generic.ipk"
           nfpm package --config nfpm.yaml --packager apk --target "${PKG_NAME}_${VERSION}_aarch64.apk"
-
+          
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:

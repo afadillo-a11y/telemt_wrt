@@ -1,4 +1,4 @@
-name: Build and Release LuCI App for HEV SOCKS5 Tunnel v2
+name: Build and Release LuCI App for HEV SOCKS5 Tunnel v3
 
 on:
   push:
@@ -17,17 +17,20 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      PKG_NAME: luci-app-hev-socks5-tunnel
 
     steps:
       - name: Extract version
         id: vars
         run: |
+          set -euxo pipefail
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "VERSION=${{ github.event.inputs.build_target }}" >> $GITHUB_ENV
+            echo "VERSION=${{ github.event.inputs.build_target }}" >> "$GITHUB_ENV"
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_ENV"
           else
-            echo "VERSION=nightly" >> $GITHUB_ENV
+            echo "VERSION=nightly" >> "$GITHUB_ENV"
           fi
 
       - name: Checkout local repository
@@ -97,7 +100,7 @@ jobs:
               echo "$1" | grep -Eq '^[A-Za-z0-9._:-]+$'
           }
 
-          json_escape() {
+          yaml_escape() {
               printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
           }
 
@@ -140,7 +143,7 @@ jobs:
             workers: 1
 
           tunnel:
-            name: "$(json_escape "$tunnel_name")"
+            name: "$(yaml_escape "$tunnel_name")"
             mtu: $mtu
             ipv6: $(render_bool "$ipv6")
             multi-queue: false
@@ -148,20 +151,20 @@ jobs:
             udp-buffer-size: $udp_buffer_size
 
           socks5:
-            address: "$(json_escape "$server_host")"
+            address: "$(yaml_escape "$server_host")"
             port: $server_port
             udp: $(render_bool "$udp")
           YAML
 
           if [ -n "$username" ]; then
             cat >> "$OUT_FILE" <<YAML
-            username: "$(json_escape "$username")"
+            username: "$(yaml_escape "$username")"
           YAML
           fi
 
           if [ -n "$password" ]; then
             cat >> "$OUT_FILE" <<YAML
-            password: "$(json_escape "$password")"
+            password: "$(yaml_escape "$password")"
           YAML
           fi
 
@@ -179,7 +182,7 @@ jobs:
             cat >> "$OUT_FILE" <<YAML
 
           mapdns:
-            address: "$(json_escape "$mapdns_host")"
+            address: "$(yaml_escape "$mapdns_host")"
             port: $mapdns_port
           YAML
           fi
@@ -964,7 +967,7 @@ jobs:
           export PKG_VER="${{ env.VERSION }}"
           ARCHS=("aarch64_generic" "aarch64_cortex-a53")
 
-          cat > postinst.sh <<EOF
+          cat > postinst.sh <<'EOF'
           #!/bin/sh
           /etc/init.d/luci-hev-socks5-tunnel-route enable 2>/dev/null || true
           /usr/libexec/luci-hev-socks5-tunnel-render >/dev/null 2>&1 || true
@@ -973,7 +976,7 @@ jobs:
           exit 0
           EOF
 
-          cat > prerm.sh <<EOF
+          cat > prerm.sh <<'EOF'
           #!/bin/sh
           /etc/init.d/luci-hev-socks5-tunnel-route stop 2>/dev/null || true
           /etc/init.d/luci-hev-socks5-tunnel-route disable 2>/dev/null || true
@@ -1022,7 +1025,7 @@ jobs:
           overrides:
             ipk:
               fields:
-                Depends: "hev-socks5-tunnel, luci-base, rpcd, rpcd-mod-file, uci, ip-full"
+                Depends: "hev-socks5-tunnel, luci-base, rpcd, rpcd-mod-file, ip-full"
           EOF
             nfpm package --config nfpm_ipk.yaml --packager ipk --target "${PKG_NAME}_${PKG_VER}_${ARCH}.ipk"
           done
@@ -1064,7 +1067,7 @@ jobs:
           overrides:
             apk:
               fields:
-                depends: "hev-socks5-tunnel, luci-base, rpcd, rpcd-mod-file, uci, ip-full"
+                depends: "hev-socks5-tunnel, luci-base, rpcd, rpcd-mod-file, ip-full"
           EOF
             nfpm package --config nfpm_apk.yaml --packager apk --target "${PKG_NAME}_${PKG_VER}_${ARCH}.apk"
           done

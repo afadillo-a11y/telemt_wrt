@@ -1,7 +1,7 @@
 #!/bin/sh /etc/rc.common
 # ==============================================================================
 # Telemt MTProxy Service Management Script
-# Version: 3.3.16-2 (Strict TOML Types, POSIX, Graceful Save)
+# Version: 3.3.16-3 (Strict Validation, Graceful Kill, Failsafe TOML)
 # ==============================================================================
 START=99
 STOP=10
@@ -12,14 +12,16 @@ extra_command "run_save_stats" "Force dump prometheus metrics to RAM before shut
 
 PROG="$(command -v telemt 2>/dev/null || echo /usr/bin/telemt)"
 
-# Helper functions
+# ------------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# ------------------------------------------------------------------------------
 is_cidr() { 
     case "$1" in *[!0-9A-Fa-f:./]* ) return 1 ;; esac
     echo "$1" | grep -qE '^[0-9A-Fa-f:.]+/[0-9]{1,3}$'
 }
 
 is_uint() { 
-    echo "$1" | grep -qE '^[0-9]+$'
+    [ -n "$1" ] && echo "$1" | grep -qE '^[0-9]+$'
 }
 
 sanitize_toml_value() { 
@@ -37,13 +39,14 @@ fetch_metrics() {
     fi
 }
 
+# ------------------------------------------------------------------------------
+# METRICS DUMP
+# ------------------------------------------------------------------------------
 run_save_stats() {
     local m_port=$(uci -q get telemt.general.metrics_port || echo 9092)
     local tmp_file="/tmp/telemt_stats.txt"
     local tmp_live=$(mktemp /tmp/telemt_live.XXXXXX)
     local tmp_stat=$(mktemp /tmp/telemt_stats.XXXXXX)
-    
-    trap 'rm -f "$tmp_live" "$tmp_stat"' EXIT INT TERM
     
     local pid=""
     for p in $(pidof telemt 2>/dev/null); do
@@ -53,10 +56,17 @@ run_save_stats() {
         fi
     done
     
-    if [ -z "$pid" ]; then return 0; fi
+    if [ -z "$pid" ]; then 
+        rm -f "$tmp_live" "$tmp_stat"
+        return 0
+    fi
     
     local raw=$(fetch_metrics "http://127.0.0.1:${m_port}/metrics" 2>/dev/null)
-    if [ -z "$raw" ]; then return 0; fi
+    if [ -z "$raw" ]; then 
+        rm -f "$tmp_live" "$tmp_stat"
+        return 0
+    fi
+    
     touch "$tmp_file" 2>/dev/null
     
     echo "$raw" | awk '
@@ -75,15 +85,15 @@ run_save_stats() {
             mv "$tmp_stat" "$tmp_file"
         fi
     fi
+    
+    rm -f "$tmp_live" "$tmp_stat"
 }
 
+# ------------------------------------------------------------------------------
+# TOML GENERATOR
+# ------------------------------------------------------------------------------
 generate_toml() {
     local target_file="$1"
-    
-    local enabled mode port api_port metrics_port ext_rt m_alo m_alan metrics_whitelist domain log_level use_mp use_stun ad_tag announce_ip external_ip
-    local tm_handshake tm_connect tm_keepalive tm_ack listen_ipv4 listen_ipv6 prefer_ip fake_cert_len tls_full_cert_ttl_secs replay_window_secs ignore_time_skew
-    local me_pool_size me_warm_standby hardswap me_drain_ttl auto_deg deg_min_dc desync_all mask_proxy_protocol
-    local me_floor_mode me_idle_secs me_grace_secs me_min_single me_shadow_writers me_outage_mode me_outage_no_quarantine me_shadow_rotate
     
     local TMP_LINKS=$(mktemp /tmp/telemt_links.XXXXXX)
     local TMP_USERS=$(mktemp /tmp/telemt_users.XXXXXX)
@@ -93,13 +103,24 @@ generate_toml() {
     local TMP_EXP=$(mktemp /tmp/telemt_exp.XXXXXX)
     local TMP_CONF=$(mktemp /var/etc/telemt.toml.XXXXXX)
     
-    trap 'rm -f "$TMP_LINKS" "$TMP_USERS" "$TMP_CONNS" "$TMP_IPS" "$TMP_QUOTA" "$TMP_EXP" "$TMP_CONF"' EXIT INT TERM
+    cleanup_tmp() {
+        rm -f "$TMP_LINKS" "$TMP_USERS" "$TMP_CONNS" "$TMP_IPS" "$TMP_QUOTA" "$TMP_EXP" "$TMP_CONF"
+    }
+
+    local mode port api_port metrics_port ext_rt m_alo m_alan metrics_whitelist domain log_level use_mp use_stun ad_tag announce_ip external_ip
+    local tm_handshake tm_connect tm_keepalive tm_ack listen_ipv4 listen_ipv6 prefer_ip fake_cert_len tls_full_cert_ttl_secs replay_window_secs ignore_time_skew
+    local me_pool_size me_warm_standby hardswap me_drain_ttl auto_deg deg_min_dc desync_all mask_proxy_protocol
+    local me_floor_mode me_idle_secs me_grace_secs me_min_single me_shadow_writers me_outage_mode me_outage_no_quarantine me_shadow_rotate
     
     config_get mode general mode "tls"
     config_get port general port "8443"
     config_get metrics_port general metrics_port "9092"
     config_get api_port general api_port "9091"
-    config_get_bool ext_rt general extended_runtime_enabled 1
+    
+    # 1. Port Arithmetic Protection
+    is_uint "$port" || port=8443
+    is_uint "$metrics_port" || metrics_port=9092
+    is_uint "$api_port" || api_port=9091
     
     if [ "$metrics_port" -eq "$api_port" ]; then
         api_port=$((metrics_port + 1))
@@ -107,27 +128,45 @@ generate_toml() {
     fi
     if [ "$port" -eq "$api_port" ] || [ "$port" -eq "$metrics_port" ]; then
         logger -t telemt "Init: CRITICAL ERROR! Proxy port conflicts with API/Metrics."
+        cleanup_tmp
         return 1
     fi
     
+    config_get_bool ext_rt general extended_runtime_enabled 1
     config_get_bool m_alo general metrics_allow_lo 1
     config_get_bool m_alan general metrics_allow_lan 1
     config_get metrics_whitelist general metrics_whitelist ""
-    config_get log_level general log_level "normal"
     config_get domain general domain "google.com"
     config_get external_ip general external_ip ""
-    config_get_bool listen_ipv4 general listen_ipv4 1
-    config_get_bool listen_ipv6 general listen_ipv6 0
+    config_get announce_ip general announce_ip ""
     
-    # [BUGFIX] Ensure numeric type for preferred IP version
+    # 2. Strict Enum Normalization
+    config_get log_level general log_level "normal"
+    case "$log_level" in debug|verbose|normal|silent) ;; *) log_level="normal" ;; esac
+    
+    config_get me_floor_mode general me_floor_mode "static"
+    case "$me_floor_mode" in static|adaptive) ;; *) me_floor_mode="static" ;; esac
+
+    config_get mask_proxy_protocol general mask_proxy_protocol "0"
+    case "$mask_proxy_protocol" in 1|2) ;; *) mask_proxy_protocol="0" ;; esac
+
     config_get prefer_ip general prefer_ip "4"
     if [ "$prefer_ip" != "4" ] && [ "$prefer_ip" != "6" ]; then prefer_ip="4"; fi
     
+    # 3. Domain and IP Sanitation (Failsafe logic)
+    domain=$(echo "$domain" | tr -cd 'A-Za-z0-9.-')
+    [ -z "$domain" ] && domain="google.com"
+    
+    announce_ip=$(echo "$announce_ip" | tr -cd 'A-Za-z0-9.-')
+    external_ip=$(echo "$external_ip" | awk '{print $1}' | tr -cd 'A-Za-z0-9.-')
+    [ -z "$announce_ip" ] && announce_ip="$external_ip"
+    
+    config_get_bool listen_ipv4 general listen_ipv4 1
+    config_get_bool listen_ipv6 general listen_ipv6 0
     config_get tm_handshake general tm_handshake "15"
     config_get tm_connect general tm_connect "10"
     config_get tm_keepalive general tm_keepalive "60"
     config_get tm_ack general tm_ack "300"
-    
     config_get_bool use_mp general use_middle_proxy 0
     config_get_bool use_stun general use_stun 0
     config_get me_pool_size general me_pool_size "16"
@@ -136,8 +175,6 @@ generate_toml() {
     config_get me_drain_ttl general me_drain_ttl "90"
     config_get_bool auto_deg general auto_degradation 1
     config_get deg_min_dc general degradation_min_dc "2"
-    
-    config_get me_floor_mode general me_floor_mode "static"
     config_get me_idle_secs general me_adaptive_floor_idle_secs "600"
     config_get me_grace_secs general me_adaptive_floor_recover_grace_secs "120"
     config_get me_min_single general me_adaptive_floor_min_writers_single_endpoint "1"
@@ -145,21 +182,14 @@ generate_toml() {
     config_get_bool me_outage_mode general me_single_endpoint_outage_mode_enabled 1
     config_get_bool me_outage_no_quarantine general me_single_endpoint_outage_disable_quarantine 1
     config_get me_shadow_rotate general me_single_endpoint_shadow_rotate_every_secs "900"
-    
     config_get_bool desync_all general desync_all_full 0
     config_get ad_tag general ad_tag ""
-    config_get announce_ip general announce_ip ""
     config_get fake_cert_len general fake_cert_len "2048"
     config_get tls_full_cert_ttl_secs general tls_full_cert_ttl_secs "0"
     config_get replay_window_secs general replay_window_secs "1800"
     config_get_bool ignore_time_skew general ignore_time_skew 0
-    config_get mask_proxy_protocol general mask_proxy_protocol "0"
     
-    domain=$(echo "$domain" | tr -cd 'A-Za-z0-9.-')
     ad_tag=$(sanitize_toml_value "$ad_tag" | tr -cd 'A-Fa-f0-9')
-    announce_ip=$(sanitize_toml_value "$announce_ip")
-    if [ -n "$external_ip" ]; then external_ip=$(echo "$external_ip" | awk '{print $1}'); fi
-    if [ -z "$announce_ip" ] && [ -n "$external_ip" ]; then announce_ip="$external_ip"; fi
     
     local mp_str="false"; [ "$use_mp" -eq 1 ] && mp_str="true"
     local stun_str="false"; [ "$use_stun" -eq 1 ] && stun_str="true"
@@ -217,7 +247,6 @@ generate_toml() {
 
     # ================= CORE CONFIGURATION =================
     
-    # [BUGFIX] prefer expects an integer without quotes
     cat <<TOML > "$TMP_CONF"
 [network]
 ipv4 = $v4_str
@@ -350,12 +379,19 @@ TOML
         if [ -n "$i" ] && [ "$i" != "unlimited" ] && is_uint "$i"; then echo "$1 = $i" >> "$TMP_IPS"; fi 
     }
     
+    # 4. Strict Quota Sanitation (Prevents garbage input from dropping quota to 0)
     add_user_quota() { 
         is_user_enabled "$1" || return 0
         local q; config_get q "$1" data_quota
         if [ -n "$q" ] && [ "$q" != "unlimited" ]; then 
-            local b=$(echo "$q" | sed 's/,/\./g' | awk '{printf "%.0f", $1 * 1073741824}')
-            if [ -n "$b" ] && is_uint "$b"; then echo "$1 = $b" >> "$TMP_QUOTA"; fi
+            if echo "$q" | grep -qE '^[0-9]+([.,][0-9]+)?$'; then
+                local b=$(echo "$q" | sed 's/,/\./g' | awk '{printf "%.0f", $1 * 1073741824}')
+                if [ -n "$b" ] && is_uint "$b" && [ "$b" -gt 0 ]; then 
+                    echo "$1 = $b" >> "$TMP_QUOTA"
+                fi
+            else
+                logger -t telemt "Init: Warning - Invalid data_quota '$q' for user $1. Ignored."
+            fi
         fi 
     }
     
@@ -395,7 +431,9 @@ TOML
     handle_upstream() {
         local s="$1"
         local u_en u_type u_addr u_user u_pass u_weight u_scopes u_interface
-        config_get_bool u_en "$s" enabled 0
+        
+        # 5. Fix legacy upstream enabled state default to 1
+        config_get_bool u_en "$s" enabled 1
         [ "$u_en" -ne 1 ] && return
         
         config_get u_type "$s" type "direct"
@@ -433,8 +471,7 @@ TOML
     fi
     
     mv "$TMP_CONF" "$target_file"
-    rm -f "$TMP_USERS" "$TMP_CONNS" "$TMP_QUOTA" "$TMP_IPS" "$TMP_LINKS" "$TMP_EXP" "$TMP_CONF"
-    trap - EXIT INT TERM
+    cleanup_tmp
 }
 
 start_service() {
@@ -445,16 +482,24 @@ start_service() {
     config_get_bool enabled general enabled 0
     if [ "$enabled" -ne 1 ]; then return 0; fi
 
-    if [ -x "$PROG" ]; then
-        mkdir -p /var/etc
-        local ver=$(tail -c 128 "$PROG" 2>/dev/null | grep -a -i 'MTProxy v' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
-        if [ -n "$ver" ]; then 
-            echo "$ver" > /var/etc/telemt.version
-            chmod 644 /var/etc/telemt.version
-        fi
+    # 6. Strict Binary Check
+    if [ ! -x "$PROG" ]; then
+        logger -t telemt "Init: CRITICAL ERROR! Binary not found or not executable at $PROG"
+        return 1
+    fi
+    
+    mkdir -p /var/etc
+    local ver=$(tail -c 128 "$PROG" 2>/dev/null | grep -a -i 'MTProxy v' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    if [ -n "$ver" ]; then 
+        echo "$ver" > /var/etc/telemt.version
+        chmod 644 /var/etc/telemt.version
     fi
 
-    generate_toml "$CONF"
+    # 7. Check if TOML Generation succeeded
+    if ! generate_toml "$CONF"; then
+        logger -t telemt "Init: TOML generation failed. Aborting start."
+        return 1
+    fi
     chmod 600 "$CONF"
     
     local port auto_fw
@@ -498,7 +543,12 @@ reload_service() {
     fi
     
     local NEW_CONF="/tmp/telemt.toml.new"
-    generate_toml "$NEW_CONF"
+    # 8. Check if TOML Generation succeeded before hot-reload
+    if ! generate_toml "$NEW_CONF"; then
+        logger -t telemt "Init: TOML generation failed. Aborting reload."
+        rm -f "$NEW_CONF"
+        return 1
+    fi
     chmod 600 "$NEW_CONF"
     
     sed -n '1,/^# --- DYNAMIC CONFIG ---/p' "$CONF" 2>/dev/null > /tmp/telemt_core.old
@@ -519,10 +569,13 @@ reload_service() {
 stop_service() {
     [ "$TELEMT_NO_SAVE" != "1" ] && run_save_stats
     
+    # 9. Graceful Process Termination (TERM -> Wait -> KILL)
     for p in $(pidof telemt 2>/dev/null); do
         local comm=$(cat "/proc/$p/comm" 2>/dev/null)
         if [ "$comm" = "telemt" ]; then
-            kill -9 "$p" 2>/dev/null
+            kill -TERM "$p" 2>/dev/null
+            sleep 1
+            kill -KILL "$p" 2>/dev/null
         fi
     done
 }

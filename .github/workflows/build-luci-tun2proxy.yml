@@ -127,6 +127,8 @@ jobs:
               option run_local_udpgw '0'
               option udpgw_server '127.0.0.1:7300'
               option udpgw_listen '127.0.0.1:7300'
+              list route_include '192.168.50.0/24'
+              list route_exclude '192.168.11.0/24'
           EOF
 
           cat > "${PKGROOT}/etc/init.d/tun2proxy" <<'EOF'
@@ -171,7 +173,26 @@ jobs:
           }
 
           is_ipv4() {
-              echo "$1" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'
+              echo "$1" | grep -Eq '^(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){3}$'
+          }
+
+          is_ipv4_cidr() {
+              local v="$1"
+              local ip mask
+
+              case "$v" in
+                  */*)
+                      ip="${v%/*}"
+                      mask="${v#*/}"
+                      is_ipv4 "$ip" || return 1
+                      echo "$mask" | grep -Eq '^(3[0-2]|[12]?[0-9])$' || return 1
+                      return 0
+                  ;;
+                  *)
+                      is_ipv4 "$v"
+                      return $?
+                  ;;
+              esac
           }
 
           resolve_ipv4() {
@@ -203,7 +224,7 @@ jobs:
 
               if command -v nslookup >/dev/null 2>&1; then
                   ip="$(nslookup "$host" 2>/dev/null | awk '/^Address [0-9]+: /{print $3; exit} /^Address: /{print $2; exit}')"
-                  echo "$ip" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && {
+                  echo "$ip" | grep -Eq '^(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){3}$' && {
                       printf '%s\n' "$ip"
                       return 0
                   }
@@ -212,27 +233,38 @@ jobs:
               return 1
           }
 
-          get_default_gw() {
-              ip route show default 2>/dev/null | awk '/default/ {print $3; exit}'
+          get_route_dev_for_ip() {
+              local ip="$1"
+              ip route get "$ip" 2>/dev/null | awk '{
+                  for (i = 1; i <= NF; i++) {
+                      if ($i == "dev") {
+                          print $(i + 1)
+                          exit
+                      }
+                  }
+              }'
           }
 
-          get_default_dev() {
-              ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'
+          get_route_via_for_ip() {
+              local ip="$1"
+              ip route get "$ip" 2>/dev/null | awk '{
+                  for (i = 1; i <= NF; i++) {
+                      if ($i == "via") {
+                          print $(i + 1)
+                          exit
+                      }
+                  }
+              }'
           }
 
           add_bypass_route() {
-              local proxy host ip4 gw dev
+              local proxy host ip4 via dev
 
               config_load tun2proxy
               config_get proxy main proxy
 
               host="$(proxy_host "$proxy")"
-              gw="$(get_default_gw)"
-              dev="$(get_default_dev)"
-
               [ -n "$host" ] || return 0
-              [ -n "$gw" ] || return 0
-              [ -n "$dev" ] || return 0
 
               ip4="$(resolve_ipv4 "$host" 2>/dev/null || true)"
               [ -n "$ip4" ] || {
@@ -240,7 +272,19 @@ jobs:
                   return 0
               }
 
-              ip route replace "$ip4" via "$gw" dev "$dev" 2>/dev/null || true
+              dev="$(get_route_dev_for_ip "$ip4")"
+              via="$(get_route_via_for_ip "$ip4")"
+
+              [ -n "$dev" ] || {
+                  logger -t "$SERVICE_NAME" "Unable to determine route device for proxy endpoint '$ip4'"
+                  return 0
+              }
+
+              if [ -n "$via" ]; then
+                  ip route replace "$ip4" via "$via" dev "$dev" 2>/dev/null || true
+              else
+                  ip route replace "$ip4" dev "$dev" 2>/dev/null || true
+              fi
           }
 
           del_bypass_route() {
@@ -253,7 +297,6 @@ jobs:
               ip4="$(resolve_ipv4 "$host" 2>/dev/null || true)"
 
               [ -n "$ip4" ] || return 0
-
               ip route del "$ip4" 2>/dev/null || true
           }
 
@@ -267,16 +310,100 @@ jobs:
               ip route del 128.0.0.0/1 dev "$TUN_IF" 2>/dev/null || true
           }
 
-          wait_for_tun() {
-              local timeout=12
+          _apply_include_route() {
+              local entry="$1"
+
+              is_ipv4_cidr "$entry" || {
+                  logger -t "$SERVICE_NAME" "Ignoring invalid route_include entry: $entry"
+                  return 0
+              }
+
+              ip route replace "$entry" dev "$TUN_IF" 2>/dev/null || true
+          }
+
+          apply_include_routes() {
+              config_list_foreach main route_include _apply_include_route
+          }
+
+          _remove_include_route() {
+              local entry="$1"
+
+              is_ipv4_cidr "$entry" || return 0
+              ip route del "$entry" dev "$TUN_IF" 2>/dev/null || true
+          }
+
+          remove_include_routes() {
+              config_list_foreach main route_include _remove_include_route
+          }
+
+          _apply_exclude_route() {
+              local entry="$1"
+              local probe_ip dev via
+
+              is_ipv4_cidr "$entry" || {
+                  logger -t "$SERVICE_NAME" "Ignoring invalid route_exclude entry: $entry"
+                  return 0
+              }
+
+              probe_ip="${entry%/*}"
+              dev="$(get_route_dev_for_ip "$probe_ip")"
+              via="$(get_route_via_for_ip "$probe_ip")"
+
+              [ -n "$dev" ] || return 0
+
+              if [ -n "$via" ]; then
+                  ip route replace "$entry" via "$via" dev "$dev" 2>/dev/null || true
+              else
+                  ip route replace "$entry" dev "$dev" 2>/dev/null || true
+              fi
+          }
+
+          apply_exclude_routes() {
+              config_list_foreach main route_exclude _apply_exclude_route
+          }
+
+          _remove_exclude_route() {
+              local entry="$1"
+
+              is_ipv4_cidr "$entry" || return 0
+              ip route del "$entry" 2>/dev/null || true
+          }
+
+          remove_exclude_routes() {
+              config_list_foreach main route_exclude _remove_exclude_route
+          }
+
+          wait_and_setup_routes() {
+              local default_route timeout=20
+
+              config_load tun2proxy
+              config_get_bool default_route main default_route 0
 
               while [ "$timeout" -gt 0 ]; do
-                  [ -d "/sys/class/net/$TUN_IF" ] && return 0
+                  if [ -d "/sys/class/net/$TUN_IF" ]; then
+                      ip link set dev "$TUN_IF" up 2>/dev/null || true
+
+                      if ip link show "$TUN_IF" 2>/dev/null | grep -qv 'state DOWN'; then
+                          add_bypass_route
+
+                          if [ "$default_route" -eq 1 ]; then
+                              add_default_routes
+                          fi
+
+                          apply_include_routes
+                          apply_exclude_routes
+
+                          logger -t "$SERVICE_NAME" "TUN device '$TUN_IF' is operational, routes applied"
+                          return 0
+                      fi
+                  fi
+
                   sleep 1
                   timeout=$((timeout - 1))
               done
 
-              return 1
+              logger -t "$SERVICE_NAME" "TUN device '$TUN_IF' did not become operational in time"
+              return 0
           }
 
           start_local_udpgw() {
@@ -302,12 +429,11 @@ jobs:
           }
 
           start_main_tunnel() {
-              local enabled proxy default_route udp_over_tcp udpgw_server run_local_udpgw udpgw_listen
+              local enabled proxy udp_over_tcp udpgw_server run_local_udpgw udpgw_listen
 
               config_load tun2proxy
               config_get_bool enabled main enabled 0
               config_get proxy main proxy
-              config_get_bool default_route main default_route 0
               config_get_bool udp_over_tcp main udp_over_tcp 0
               config_get_bool run_local_udpgw main run_local_udpgw 0
               config_get udpgw_server main udpgw_server
@@ -319,8 +445,6 @@ jobs:
                   return 1
               }
 
-              # If local UDPGW is enabled and the user left the UDPGW server field empty,
-              # reuse the local listen address.
               if [ "$udp_over_tcp" -eq 1 ] && [ "$run_local_udpgw" -eq 1 ] && [ -z "$udpgw_server" ]; then
                   udpgw_server="$udpgw_listen"
               fi
@@ -334,20 +458,11 @@ jobs:
               procd_set_param stderr 1
               procd_close_instance
 
-              if wait_for_tun; then
-                  ip link set dev "$TUN_IF" up 2>/dev/null || true
-
-                  if [ "$default_route" -eq 1 ]; then
-                      add_bypass_route
-                      add_default_routes
-                  fi
-              else
-                  logger -t "$SERVICE_NAME" "TUN device '$TUN_IF' was not created in time"
-              fi
+              # Route setup is detached so service startup remains responsive.
+              wait_and_setup_routes &
           }
 
           start_service() {
-              # Start local UDPGW first so the main service can reference it immediately if needed.
               start_local_udpgw
               start_main_tunnel
           }
@@ -355,6 +470,8 @@ jobs:
           stop_service() {
               del_default_routes
               del_bypass_route
+              remove_include_routes
+              remove_exclude_routes
           }
 
           reload_service() {
@@ -404,15 +521,20 @@ jobs:
           cat > "${PKGROOT}/usr/share/rpcd/acl.d/luci-app-tun2proxy.json" <<'EOF'
           {
             "luci-app-tun2proxy": {
-              "description": "Grant access to Tun2Proxy configuration, service control and tun0 runtime checks",
+              "description": "Grant access to Tun2Proxy configuration, service control and runtime diagnostics",
               "read": {
                 "uci": [ "tun2proxy" ],
                 "ubus": {
                   "service": [ "list" ],
-                  "file": [ "stat" ]
+                  "file": [ "stat", "read", "exec" ]
                 },
                 "file": {
-                  "/sys/class/net/tun0": [ "stat" ]
+                  "/sys/class/net/tun0": [ "stat" ],
+                  "/var/run/tun2proxy.pid": [ "read" ],
+                  "/var/run/tun2proxy-udpgw.pid": [ "read" ],
+                  "/proc/meminfo": [ "read" ],
+                  "/proc/%": [ "read" ],
+                  "/sbin/logread": [ "exec" ]
                 }
               },
               "write": {
@@ -433,6 +555,7 @@ jobs:
           'require poll';
           'require ui';
           'require uci';
+          'require fs';
 
           var callServiceList = rpc.declare({
               object: 'service',
@@ -448,12 +571,19 @@ jobs:
               expect: { result: false }
           });
 
-          var callFileStat = rpc.declare({
-              object: 'file',
-              method: 'stat',
-              params: [ 'path' ],
-              expect: { '': {} }
-          });
+          function isValidIPv4(s) {
+              return /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/.test(String(s || ''));
+          }
+
+          function isValidIPv4CIDR(s) {
+              var v = String(s || '');
+              var m = v.match(/^(.+)\/(\d{1,2})$/);
+
+              if (!m)
+                  return isValidIPv4(v);
+
+              return isValidIPv4(m[1]) && (+m[2] >= 0 && +m[2] <= 32);
+          }
 
           function readInstances(reply) {
               var svc = (reply || {}).tun2proxy || {};
@@ -469,68 +599,198 @@ jobs:
               };
           }
 
+          function pidFromText(data) {
+              var s = String(data || '').trim();
+              return /^\d+$/.test(s) ? s : null;
+          }
+
           function badge(label, ok) {
-              return '<span style="color:' + (ok ? '#16a34a' : '#dc2626') + '; font-weight:600">' + label + '</span>';
+              return '<span style="display:inline-block;padding:2px 8px;border-radius:999px;font-weight:600;color:#fff;background:' +
+                  (ok ? '#16a34a' : '#dc2626') + '">' + label + '</span>';
+          }
+
+          function formatKBToMB(kb) {
+              var n = parseInt(kb, 10);
+              if (isNaN(n) || n < 0)
+                  return '-';
+              return (n / 1024).toFixed(1) + ' MB';
           }
 
           return view.extend({
+              _statusNode: null,
+              _logNode: null,
+              _actionNode: null,
+              _buttons: [],
+              _pollRegistered: false,
+
               load: function() {
                   return Promise.all([
-                      uci.load('tun2proxy'),
-                      callServiceList('tun2proxy'),
-                      L.resolveDefault(callFileStat('/sys/class/net/tun0'), null)
+                      uci.load('tun2proxy')
                   ]);
               },
 
-              handleServiceAction: function(action, ev) {
-                  return ui.createHandlerFn(this, function() {
-                      return callInitAction('tun2proxy', action).then(function() {
-                          return Promise.all([
-                              uci.load('tun2proxy'),
-                              callServiceList('tun2proxy'),
-                              L.resolveDefault(callFileStat('/sys/class/net/tun0'), null)
-                          ]);
-                      }).then(L.bind(this.render, this)).catch(function(err) {
-                          ui.addNotification(null, E('p', {}, err.message || _('Operation failed')));
-                      });
-                  })(ev);
+              readProcStatusValue: function(pid, fieldName) {
+                  if (!pid)
+                      return Promise.resolve(null);
+
+                  return L.resolveDefault(fs.read_direct('/proc/' + pid + '/status'), '').then(function(txt) {
+                      var m = String(txt || '').match(new RegExp('^' + fieldName + ':\\s+([0-9]+)\\s+kB$', 'm'));
+                      return m ? m[1] : null;
+                  });
               },
 
-              render: function(data) {
-                  var svc = readInstances(data[1]);
-                  var tunStat = data[2];
+              readMemAvailable: function() {
+                  return L.resolveDefault(fs.read_direct('/proc/meminfo'), '').then(function(txt) {
+                      var m = String(txt || '').match(/^MemAvailable:\s+([0-9]+)\s+kB$/m);
+                      return m ? m[1] : null;
+                  });
+              },
+
+              fetchRuntime: function() {
+                  return Promise.all([
+                      L.resolveDefault(callServiceList('tun2proxy'), {}),
+                      L.resolveDefault(fs.stat('/sys/class/net/tun0'), null),
+                      L.resolveDefault(fs.read_direct('/var/run/tun2proxy.pid'), ''),
+                      L.resolveDefault(fs.read_direct('/var/run/tun2proxy-udpgw.pid'), '')
+                  ]).then(L.bind(function(res) {
+                      var state = readInstances(res[0]);
+                      var tunStat = res[1];
+                      var mainPidFile = pidFromText(res[2]);
+                      var udpgwPidFile = pidFromText(res[3]);
+
+                      if (!state.mainPid && mainPidFile)
+                          state.mainPid = mainPidFile;
+                      if (!state.mainRunning && mainPidFile)
+                          state.mainRunning = true;
+
+                      if (!state.udpgwPid && udpgwPidFile)
+                          state.udpgwPid = udpgwPidFile;
+                      if (!state.udpgwRunning && udpgwPidFile)
+                          state.udpgwRunning = true;
+
+                      return Promise.all([
+                          Promise.resolve(state),
+                          Promise.resolve(tunStat),
+                          this.readProcStatusValue(state.mainPid, 'VmRSS'),
+                          this.readProcStatusValue(state.udpgwPid, 'VmRSS'),
+                          this.readMemAvailable()
+                      ]);
+                  }, this)).then(function(res) {
+                      return {
+                          state: res[0],
+                          tun: res[1],
+                          mainRssKb: res[2],
+                          udpgwRssKb: res[3],
+                          freeMemKb: res[4]
+                      };
+                  });
+              },
+
+              renderStatusHtml: function(runtime) {
+                  var state = runtime.state;
+                  var tunObj = runtime.tun;
+                  var mainPid = state.mainPid ? String(state.mainPid) : '-';
+                  var udpgwPid = state.udpgwPid ? String(state.udpgwPid) : '-';
+                  var tunText = tunObj ? _('Present') : _('Missing');
+
+                  return [
+                      '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;align-items:stretch">',
+                        '<div style="padding:10px;border:1px solid #d1d5db;border-radius:10px;background:#fff">',
+                          '<div style="font-size:12px;color:#6b7280;margin-bottom:6px">' + _('Main service') + '</div>',
+                          '<div>' + badge(state.mainRunning ? _('Running') : _('Stopped'), state.mainRunning) + '</div>',
+                          '<div style="margin-top:8px"><strong>' + _('PID') + ':</strong> ' + mainPid + '</div>',
+                          '<div style="margin-top:4px"><strong>' + _('RSS') + ':</strong> ' + formatKBToMB(runtime.mainRssKb) + '</div>',
+                        '</div>',
+                        '<div style="padding:10px;border:1px solid #d1d5db;border-radius:10px;background:#fff">',
+                          '<div style="font-size:12px;color:#6b7280;margin-bottom:6px">' + _('Local UdpGW') + '</div>',
+                          '<div>' + badge(state.udpgwRunning ? _('Running') : _('Stopped'), state.udpgwRunning) + '</div>',
+                          '<div style="margin-top:8px"><strong>' + _('PID') + ':</strong> ' + udpgwPid + '</div>',
+                          '<div style="margin-top:4px"><strong>' + _('RSS') + ':</strong> ' + formatKBToMB(runtime.udpgwRssKb) + '</div>',
+                        '</div>',
+                        '<div style="padding:10px;border:1px solid #d1d5db;border-radius:10px;background:#fff">',
+                          '<div style="font-size:12px;color:#6b7280;margin-bottom:6px">' + _('Tunnel interface') + '</div>',
+                          '<div><strong>tun0:</strong> ' + tunText + '</div>',
+                          '<div style="margin-top:8px"><strong>' + _('Free RAM') + ':</strong> ' + formatKBToMB(runtime.freeMemKb) + '</div>',
+                        '</div>',
+                      '</div>'
+                  ].join('');
+              },
+
+              refreshStatus: function() {
+                  if (!this._statusNode)
+                      return Promise.resolve();
+
+                  return this.fetchRuntime().then(L.bind(function(runtime) {
+                      this._statusNode.innerHTML = this.renderStatusHtml(runtime);
+                  }, this)).catch(function() {});
+              },
+
+              refreshLogs: function() {
+                  if (!this._logNode)
+                      return Promise.resolve();
+
+                  this._logNode.value = _('Refreshing logs...');
+
+                  return L.resolveDefault(fs.exec_direct('/sbin/logread', ['-e', 'tun2proxy'], 'text'), '')
+                      .then(L.bind(function(output) {
+                          this._logNode.value = String(output || '').trim() || _('No tun2proxy log entries yet.');
+                          this._logNode.scrollTop = this._logNode.scrollHeight;
+                      }, this))
+                      .catch(L.bind(function(err) {
+                          this._logNode.value = (err && err.message) ? err.message : _('Unable to read logs.');
+                      }, this));
+              },
+
+              setActionState: function(busy, text) {
+                  if (this._actionNode)
+                      this._actionNode.textContent = text || '';
+
+                  this._buttons.forEach(function(btn) {
+                      if (!btn)
+                          return;
+                      btn.disabled = !!busy;
+                  });
+              },
+
+              handleServiceAction: function(action) {
+                  return ui.createHandlerFn(this, function() {
+                      this.setActionState(true, _('Executing action: ') + action + ' ...');
+
+                      return callInitAction('tun2proxy', action)
+                          .then(L.bind(function() {
+                              return new Promise(function(resolve) { window.setTimeout(resolve, 1500); });
+                          }, this))
+                          .then(L.bind(function() {
+                              return Promise.all([
+                                  this.refreshStatus(),
+                                  this.refreshLogs()
+                              ]);
+                          }, this))
+                          .then(L.bind(function() {
+                              this.setActionState(false, _('Last action completed: ') + action);
+                          }, this))
+                          .catch(L.bind(function(err) {
+                              this.setActionState(false, (err && err.message) ? err.message : _('Operation failed'));
+                              ui.addNotification(null, E('p', {}, (err && err.message) ? err.message : _('Operation failed')));
+                          }, this));
+                  });
+              },
+
+              render: function() {
                   var m, s, o;
-
-                  function statusHtml(state, tunObj) {
-                      var mainPid = state.mainPid ? String(state.mainPid) : '-';
-                      var udpgwPid = state.udpgwPid ? String(state.udpgwPid) : '-';
-                      var tunText = tunObj ? _('Present') : _('Missing');
-
-                      return [
-                          badge(state.mainRunning ? _('Running') : _('Stopped'), state.mainRunning),
-                          ' &nbsp; | &nbsp; ',
-                          _('Main PID'), ': <strong>' + mainPid + '</strong>',
-                          ' &nbsp; | &nbsp; ',
-                          _('Local UdpGW'), ': ',
-                          badge(state.udpgwRunning ? _('Running') : _('Stopped'), state.udpgwRunning),
-                          ' &nbsp; | &nbsp; ',
-                          _('UdpGW PID'), ': <strong>' + udpgwPid + '</strong>',
-                          ' &nbsp; | &nbsp; ',
-                          _('tun0'), ': <strong>' + tunText + '</strong>'
-                      ].join('');
-                  }
+                  var self = this;
 
                   m = new form.Map('tun2proxy', _('Tun2Proxy'),
-                      _('Lightweight control page for tun2proxy with live runtime state, process IDs, tun0 presence and optional local UDPGW integration.'));
+                      _('Lightweight control page for tun2proxy with live runtime state, process IDs, memory usage, tun0 presence, validated route lists and optional local UDPGW integration.'));
 
                   s = m.section(form.TypedSection, 'tun2proxy', _('Live Status'));
                   s.anonymous = true;
 
                   o = s.option(form.DummyValue, '_status', _('Runtime state'),
-                      _('Shows whether the main tunnel service is running, whether the bundled local UdpGW helper is running, the current PIDs when available, and whether tun0 exists.'));
+                      _('Shows service state, process IDs, current memory usage, tun0 presence and available RAM. This block is updated through lightweight runtime polling instead of full page re-rendering.'));
                   o.rawhtml = true;
                   o.cfgvalue = function() {
-                      return statusHtml(svc, tunStat);
+                      return '<div data-tun2proxy-status="1">' + _('Loading status...') + '</div>';
                   };
 
                   o = s.option(form.Button, '_start');
@@ -538,21 +798,28 @@ jobs:
                   o.description = _('Start the package service immediately. If local UdpGW is enabled, it is started first, followed by tun2proxy.');
                   o.inputtitle = _('Start');
                   o.inputstyle = 'apply';
-                  o.onclick = L.bind(this.handleServiceAction, this, 'start');
+                  o.onclick = this.handleServiceAction('start');
 
                   o = s.option(form.Button, '_stop');
                   o.title = _('Stop service');
-                  o.description = _('Stop the package service immediately and remove temporary tun0 default-route overrides.');
+                  o.description = _('Stop the package service immediately and remove temporary tun0 route overrides.');
                   o.inputtitle = _('Stop');
                   o.inputstyle = 'remove';
-                  o.onclick = L.bind(this.handleServiceAction, this, 'stop');
+                  o.onclick = this.handleServiceAction('stop');
 
                   o = s.option(form.Button, '_restart');
                   o.title = _('Restart service');
-                  o.description = _('Restart both managed processes and refresh the PIDs so you can verify that a real restart happened.');
+                  o.description = _('Restart both managed processes and refresh runtime state so you can verify that a real restart happened.');
                   o.inputtitle = _('Restart');
                   o.inputstyle = 'apply';
-                  o.onclick = L.bind(this.handleServiceAction, this, 'restart');
+                  o.onclick = this.handleServiceAction('restart');
+
+                  o = s.option(form.DummyValue, '_action_state', _('Action result'),
+                      _('Shows the latest button action result without requiring a page reload.'));
+                  o.rawhtml = true;
+                  o.cfgvalue = function() {
+                      return '<div data-tun2proxy-action="1" style="min-height:1.4em;color:#6b7280">' + _('No action executed yet.') + '</div>';
+                  };
 
                   s = m.section(form.TypedSection, 'tun2proxy', _('Configuration'));
                   s.anonymous = true;
@@ -568,8 +835,44 @@ jobs:
                   o.placeholder = 'socks5://127.0.0.1:1080';
 
                   o = s.option(form.Flag, 'default_route', _('Default route to tun0'),
-                      _('Redirect all IPv4 traffic through tun0 while keeping the configured proxy endpoint reachable through the original WAN path.'));
+                      _('Redirect all IPv4 traffic through tun0 while keeping the configured proxy endpoint reachable through its original route.'));
                   o.rmempty = false;
+
+                  o = s.option(form.DynamicList, 'route_include', _('IPv4 subnets via tun0'),
+                      _('Add specific IPv4 addresses or CIDR subnets that should be routed through tun0. Each entry is validated before saving and again before route application.'));
+                  o.datatype = 'or(ip4addr, cidr4)';
+                  o.rmempty = true;
+                  o.validate = function(section_id, value) {
+                      var list = Array.isArray(value) ? value : [ value ];
+                      var i;
+
+                      for (i = 0; i < list.length; i++) {
+                          if (String(list[i] || '').length === 0)
+                              continue;
+                          if (!isValidIPv4CIDR(list[i]))
+                              return _('Each entry must be a valid IPv4 address or IPv4 CIDR subnet.');
+                      }
+
+                      return true;
+                  };
+
+                  o = s.option(form.DynamicList, 'route_exclude', _('IPv4 subnets bypass tun0'),
+                      _('Add IPv4 addresses or CIDR subnets that must stay on the original path even when tun0 routing is active. Useful for LAN management ranges, local services, or proxy-side networks.'));
+                  o.datatype = 'or(ip4addr, cidr4)';
+                  o.rmempty = true;
+                  o.validate = function(section_id, value) {
+                      var list = Array.isArray(value) ? value : [ value ];
+                      var i;
+
+                      for (i = 0; i < list.length; i++) {
+                          if (String(list[i] || '').length === 0)
+                              continue;
+                          if (!isValidIPv4CIDR(list[i]))
+                              return _('Each entry must be a valid IPv4 address or IPv4 CIDR subnet.');
+                      }
+
+                      return true;
+                  };
 
                   o = s.option(form.Flag, 'udp_over_tcp', _('Enable UDP-over-TCP'),
                       _('Enable the UdpGW transport for UDP-like traffic over TCP. This requires a reachable UdpGW server. Enable the local helper below only when your proxy path can actually reach that local address.'));
@@ -594,20 +897,49 @@ jobs:
                   o.placeholder = '127.0.0.1:7300';
                   o.depends('run_local_udpgw', '1');
 
-                  return m.render().then(function(nodes) {
-                      poll.add(function() {
-                          return Promise.all([
-                              callServiceList('tun2proxy'),
-                              L.resolveDefault(callFileStat('/sys/class/net/tun0'), null)
-                          ]).then(function(res) {
-                              var state = readInstances(res[0]);
-                              var tun = res[1];
-                              var field = nodes.querySelector('[data-name="_status"] .cbi-value-field');
+                  s = m.section(form.TypedSection, 'tun2proxy', _('Diagnostics'));
+                  s.anonymous = true;
 
-                              if (field)
-                                  field.innerHTML = statusHtml(state, tun);
+                  o = s.option(form.DummyValue, '_diag',
+                      _('Live log output'),
+                      _('Collapsed log viewer for quick diagnostics. It runs logread only when refreshed manually or after service actions, reducing CPU and browser load.'));
+                  o.rawhtml = true;
+                  o.cfgvalue = function() {
+                      return [
+                          '<details style="margin-top:4px">',
+                          '<summary style="cursor:pointer;font-weight:600">' + _('Show tun2proxy logs') + '</summary>',
+                          '<div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">',
+                          '<button type="button" class="btn cbi-button cbi-button-action" data-tun2proxy-refresh-logs="1">' + _('Refresh logs') + '</button>',
+                          '<span style="color:#6b7280">' + _('Runs: logread -e tun2proxy') + '</span>',
+                          '</div>',
+                          '<textarea data-tun2proxy-logs="1" readonly="readonly" wrap="off" style="margin-top:10px;width:100%;min-height:220px;font-family:monospace;background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:10px"></textarea>',
+                          '</details>'
+                      ].join('');
+                  };
+
+                  return m.render().then(function(nodes) {
+                      self._statusNode = nodes.querySelector('[data-tun2proxy-status="1"]');
+                      self._actionNode = nodes.querySelector('[data-tun2proxy-action="1"]');
+                      self._logNode = nodes.querySelector('[data-tun2proxy-logs="1"]');
+                      self._buttons = Array.prototype.slice.call(nodes.querySelectorAll('.cbi-button'));
+                      var logBtn = nodes.querySelector('[data-tun2proxy-refresh-logs="1"]');
+
+                      if (logBtn) {
+                          logBtn.addEventListener('click', function(ev) {
+                              ev.preventDefault();
+                              self.refreshLogs();
                           });
-                      }, 3);
+                      }
+
+                      self.refreshStatus();
+                      self.refreshLogs();
+
+                      if (!self._pollRegistered) {
+                          poll.add(function() {
+                              return self.refreshStatus();
+                          }, 8);
+                          self._pollRegistered = true;
+                      }
 
                       return nodes;
                   });
@@ -657,9 +989,8 @@ jobs:
           chmod 0755 packaging/postinstall.sh packaging/preremove.sh
 
           ARCHS=("aarch64_generic" "aarch64_cortex-a53")
-          export PKG_DESC="Highly optimized Rust tun2proxy package for OpenWrt with lightweight LuCI interface, live service controls and optional local UDP-over-TCP helper."
+          export PKG_DESC="Highly optimized Rust tun2proxy package for OpenWrt with lightweight LuCI interface, live runtime dashboard, validated route lists and optional local UDP-over-TCP helper."
 
-          # Build IPKs for both OpenWrt aarch64 targets, following the same multi-arch pattern used in the reference telemt workflow.
           export SOURCE_DATE_EPOCH=1704067200
           for ARCH in "${ARCHS[@]}"; do
             cat > nfpm_ipk.yaml <<EOF
@@ -727,7 +1058,6 @@ jobs:
             nfpm package --config nfpm_ipk.yaml --packager ipk --target "${PKG_NAME}_${VERSION}_${ARCH}.ipk"
           done
 
-          # Build APKs for both aarch64 package names for compatibility with the same artifact matrix.
           unset SOURCE_DATE_EPOCH
           for ARCH in "${ARCHS[@]}"; do
             cat > nfpm_apk.yaml <<EOF

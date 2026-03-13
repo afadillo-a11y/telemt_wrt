@@ -1,7 +1,7 @@
 #!/bin/sh /etc/rc.common
 # ==============================================================================
 # Telemt MTProxy Service Management Script
-# Version: 3.3.16-6 (Canonical Config Path, Deep Diagnostics, Smart Ver)
+# Version: 3.3.16-7 (Canonical Paths /tmp/etc/, BusyBox wget fix -T)
 # ==============================================================================
 START=99
 STOP=10
@@ -34,9 +34,9 @@ sanitize_toml_value() {
 fetch_metrics() {
     local url="$1"
     if command -v uclient-fetch >/dev/null 2>&1; then 
-        uclient-fetch -q --timeout=3 -O - "$url"
+        uclient-fetch -q -T 3 -O - "$url"
     elif command -v wget >/dev/null 2>&1; then 
-        wget -q --timeout=3 -O - "$url"
+        wget -q -T 3 -O - "$url"
     else 
         return 1
     fi
@@ -88,16 +88,16 @@ run_save_stats() {
 generate_toml() {
     local target_file="$1"
     
-    # Force pure state
+    # Force pure state by clearing all possible old config locations
     mkdir -p /tmp/etc /var/etc
     rm -f /var/etc/telemt.toml /tmp/etc/telemt.toml
     
-    local TMP_LINKS=$(mktemp /tmp/etc/telemt_links.XXXXXX)
-    local TMP_USERS=$(mktemp /tmp/etc/telemt_users.XXXXXX)
-    local TMP_CONNS=$(mktemp /tmp/etc/telemt_conns.XXXXXX)
-    local TMP_IPS=$(mktemp /tmp/etc/telemt_ips.XXXXXX)
-    local TMP_QUOTA=$(mktemp /tmp/etc/telemt_quota.XXXXXX)
-    local TMP_EXP=$(mktemp /tmp/etc/telemt_exp.XXXXXX)
+    local TMP_LINKS=$(mktemp /tmp/telemt_links.XXXXXX)
+    local TMP_USERS=$(mktemp /tmp/telemt_users.XXXXXX)
+    local TMP_CONNS=$(mktemp /tmp/telemt_conns.XXXXXX)
+    local TMP_IPS=$(mktemp /tmp/telemt_ips.XXXXXX)
+    local TMP_QUOTA=$(mktemp /tmp/telemt_quota.XXXXXX)
+    local TMP_EXP=$(mktemp /tmp/telemt_exp.XXXXXX)
     local TMP_CONF=$(mktemp /tmp/etc/telemt.toml.XXXXXX)
     
     cleanup_tmp() { rm -f "$TMP_LINKS" "$TMP_USERS" "$TMP_CONNS" "$TMP_IPS" "$TMP_QUOTA" "$TMP_EXP" "$TMP_CONF"; }
@@ -160,6 +160,7 @@ generate_toml() {
     config_get_bool use_mp general use_middle_proxy 0
     config_get_bool use_stun general use_stun 0
     
+    # Isolate ME options strictly if disabled
     if [ "$use_mp" -eq 1 ]; then
         config_get me_pool_size general me_pool_size "16"
         config_get me_warm_standby general me_warm_standby "8"
@@ -255,7 +256,6 @@ use_middle_proxy = $mp_str
 log_level = "$log_level"
 TOML
 
-    # Strict omission of ME config if disabled to prevent fallback loops
     if [ "$use_mp" -eq 1 ]; then
         [ -n "$ad_tag" ] && echo "ad_tag = \"$ad_tag\"" >> "$TMP_CONF"
         cat <<TOML >> "$TMP_CONF"

@@ -110,7 +110,7 @@ generate_toml() {
     #   me_floor_mode, me_idle_secs, me_grace_secs, me_min_single,
     #   me_shadow_writers, me_outage_mode, me_outage_no_quarantine, me_shadow_rotate
     # These were silent-ignored by the Rust TOML parser — the binary self-adapts.
-    local me_pool_size me_warm_standby hardswap me_drain_ttl auto_deg deg_min_dc
+    local me_pool_size me_warm_standby me_update_every hardswap me_drain_ttl auto_deg deg_min_dc
     local desync_all mask_proxy_protocol
 
     config_get mode general mode "tls"
@@ -171,6 +171,7 @@ generate_toml() {
     if [ "$use_mp" -eq 1 ]; then
         config_get me_pool_size general me_pool_size "16"
         config_get me_warm_standby general me_warm_standby "8"
+        config_get me_update_every general update_every "300"
         config_get_bool hardswap general hardswap 1
         config_get me_drain_ttl general me_drain_ttl "90"
         config_get_bool auto_deg general auto_degradation 1
@@ -199,8 +200,8 @@ generate_toml() {
     local v4_str="false";       [ "$listen_ipv4" -eq 1 ]      && v4_str="true"
     local v6_str="false";       [ "$listen_ipv6" -eq 1 ]      && v6_str="true"
     local time_skew_str="false";[ "$ignore_time_skew" -eq 1 ] && time_skew_str="true"
-    local hardswap_str="false"; [ "$hardswap" -eq 1 ]         && hardswap_str="true"
-    local auto_deg_str="false"; [ "$auto_deg" -eq 1 ]         && auto_deg_str="true"
+    local hardswap_str="false"; [ "${hardswap:-0}" -eq 1 ]    && hardswap_str="true"
+    local auto_deg_str="false"; [ "${auto_deg:-0}" -eq 1 ]    && auto_deg_str="true"
     local api_str="false";      [ "$ext_rt" -eq 1 ]           && api_str="true"
     local minimal_rt_str="false"; [ "$ext_rt" -eq 1 ]         && minimal_rt_str="true"
 
@@ -275,9 +276,13 @@ TOML
         cat <<TOML >> "$TMP_CONF"
 middle_proxy_nat_probe = $stun_str
 middle_proxy_pool_size = $me_pool_size
-me_warm_standby = $me_warm_standby
+middle_proxy_warm_standby = $me_warm_standby
 hardswap = $hardswap_str
 me_pool_drain_ttl_secs = $me_drain_ttl
+update_every = $me_update_every
+proxy_secret_path = "/var/etc/telemt/proxy-secret"
+proxy_config_v4_cache_path = "/var/etc/telemt/proxy-config-v4.txt"
+proxy_config_v6_cache_path = "/var/etc/telemt/proxy-config-v6.txt"
 # PATCH 3.3.16: renamed me2dc_fallback → auto_degradation_enabled (correct TOML key)
 auto_degradation_enabled = $auto_deg_str
 # PATCH 3.3.16: added previously missing TOML key for min DC threshold
@@ -295,7 +300,7 @@ TOML
 
     if [ "$desync_all" -eq 1 ]; then echo "desync_all_full = true" >> "$TMP_CONF"; fi
 
-    mkdir -p /var/etc/telemt_tlsfront
+    mkdir -p /var/etc/telemt_tlsfront /var/etc/telemt
 
     cat <<TOML >> "$TMP_CONF"
 
@@ -310,6 +315,22 @@ metrics_port = $metrics_port
 metrics_whitelist = [$wl_toml]
 TOML
 
+    # [server.api] must come before [[server.listeners]].
+    # In toml-rs (Rust parser), an array-of-tables header resets the "current table"
+    # context, causing any subsequent [server.X] to be scoped under the last array entry.
+    cat <<TOML >> "$TMP_CONF"
+
+[server.api]
+enabled = $api_str
+listen = "0.0.0.0:${api_port}"
+whitelist = [$wl_toml]
+minimal_runtime_enabled = $minimal_rt_str
+minimal_runtime_cache_ttl_ms = 1000
+# explicit contract: LuCI and API clients must be able to mutate users
+read_only = false
+TOML
+
+    # [[server.listeners]] MUST come after all [server.*] sub-tables (toml-rs ordering constraint)
     if [ "$listen_ipv4" -eq 1 ]; then
         echo "[[server.listeners]]" >> "$TMP_CONF"
         echo "ip = \"0.0.0.0\"" >> "$TMP_CONF"
@@ -320,21 +341,6 @@ TOML
         echo "ip = \"::\"" >> "$TMP_CONF"
         if [ -n "$announce_ip" ]; then echo "announce = \"$announce_ip\"" >> "$TMP_CONF"; fi
     fi
-
-    cat <<TOML >> "$TMP_CONF"
-
-[server.api]
-enabled = $api_str
-listen = "0.0.0.0:${api_port}"
-whitelist = [$wl_toml]
-# extended_runtime_enabled: exposes /v1/stats/minimal/all (ME pool, DCs, writers).
-# Must be true for LuCI dashboard health grid, ME status and degradation badges.
-extended_runtime_enabled = $api_str
-minimal_runtime_enabled = $minimal_rt_str
-minimal_runtime_cache_ttl_ms = 1000
-# explicit contract: LuCI and API clients must be able to mutate users
-read_only = false
-TOML
 
     cat <<TOML >> "$TMP_CONF"
 
@@ -389,8 +395,13 @@ TOML
     }
 
     config_foreach add_user_link user
-    local links_str=""; [ -s "$TMP_LINKS" ] && links_str=$(sed 's/, $//' "$TMP_LINKS")
-    printf '\n[general.links]\nshow = [%s]\n' "$links_str" >> "$TMP_CONF"
+    local links_str=""
+    if [ -s "$TMP_LINKS" ]; then
+        links_str=$(sed 's/, $//' "$TMP_LINKS")
+        printf '\n[general.links]\nshow = [%s]\n' "$links_str" >> "$TMP_CONF"
+    else
+        printf '\n[general.links]\nshow = "*"\n' >> "$TMP_CONF"
+    fi
 
     # public_host: the IP/domain shown in tg:// links
     [ -n "$announce_ip" ] && printf 'public_host = "%s"\n' "$announce_ip" >> "$TMP_CONF"
@@ -576,13 +587,13 @@ reload_service() {
 stop_service() {
     [ "$TELEMT_NO_SAVE" != "1" ] && run_save_stats
 
-    # Graceful Process Termination: SIGTERM first, SIGKILL as last resort
+    # Graceful Process Termination: SIGTERM first, SIGKILL only if still alive after 3s
     for p in $(pidof telemt 2>/dev/null); do
         local comm=$(cat "/proc/$p/comm" 2>/dev/null)
         if [ "$comm" = "telemt" ]; then
             kill -TERM "$p" 2>/dev/null
-            sleep 1
-            kill -KILL "$p" 2>/dev/null
+            sleep 3
+            kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null
         fi
     done
 }

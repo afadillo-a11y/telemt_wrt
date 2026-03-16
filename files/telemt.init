@@ -666,7 +666,7 @@ stop() {
 restart() {
     rm -f "$MANUAL_STOP"
 
-    TELEMT_NO_SAVE=1 stop_service
+    stop_service
     if ! wait_telemt_pids_gone 1; then
         force_kill_telemt
         wait_telemt_pids_gone 2

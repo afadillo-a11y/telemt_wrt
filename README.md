@@ -1,469 +1,270 @@
-# Telemt - MTProxy on Rust + Tokio
+<h1 align="center">🚀 Headless Telemt for OpenWrt</h1>
+
+<p align="center">
+  Lightweight <b>telemt</b> binary packages for OpenWrt<br/>
+  <i>Built from the official <code>telemt/telemt</code> repository and adapted for real OpenWrt deployment</i>
+</p>
+
+<p align="center">
+  <a href="#overview">Overview</a> •
+  <a href="#whats-included">What’s included</a> •
+  <a href="#why-this-build-exists">Why this build exists</a> •
+  <a href="#build-pipeline">Build pipeline</a> •
+  <a href="#openwrt-specific-work">OpenWrt-specific work</a> •
+  <a href="#packages">Packages</a> •
+  <a href="#installation">Installation</a> •
+  <a href="#notes">Notes</a>
+</p>
+
+<hr/>
+
+<h2 id="overview">📦 Overview</h2>
+
+<p>
+This repository provides a <b>headless, lightweight OpenWrt-oriented build</b> of
+<a href="https://github.com/telemt/telemt">official telemt</a>, packaged as
+<b>IPK</b> and <b>APK</b> for modern OpenWrt targets.
+</p>
+
+<p>
+The goal is simple: take the upstream Rust daemon, build it in a compact form for
+<b>aarch64 musl</b>, and ship it together with an <b>OpenWrt-native init.d + UCI config</b>
+layer that actually matches how recent telemt versions behave in production.
+</p>
+
+<p>
+This is not a fork of the daemon logic. The binary is compiled from the
+<b>official upstream source</b>. The main customization is around
+<b>packaging, init integration, config generation, reload behavior, and OpenWrt runtime ergonomics</b>.
+</p>
+
+<hr/>
+
+<h2 id="whats-included">🧩 What’s included</h2>
+
+<ul>
+  <li>✅ <b>Official telemt binary</b> built from <code>telemt/telemt</code></li>
+  <li>✅ <b>Optimized aarch64-musl</b> release build for OpenWrt</li>
+  <li>✅ <b>UPX-compressed</b> binary to reduce footprint</li>
+  <li>✅ <b>OpenWrt init.d service</b> tailored for current telemt runtime behavior</li>
+  <li>✅ <b>Default UCI config</b> for OpenWrt integration</li>
+  <li>✅ <b>IPK</b> packages for OpenWrt package installation</li>
+  <li>✅ <b>APK</b> packages for apk-enabled OpenWrt environments</li>
+</ul>
+
+<hr/>
+
+<h2 id="why-this-build-exists">🛠️ Why this build exists</h2>
+
+<p>
+Recent telemt releases evolved significantly in runtime structure, API layout, middle-proxy behavior,
+hot-reload semantics, and config expectations.
+</p>
+
+<p>
+Because of that, the old OpenWrt service logic was no longer sufficient. A simple “drop binary into
+<code>/usr/bin</code> and keep old init scripts” approach started causing practical issues such as:
+</p>
+
+<ul>
+  <li>⚠️ stale assumptions in config generation</li>
+  <li>⚠️ mismatch between LuCI/UCI state and generated TOML</li>
+  <li>⚠️ reload/restart edge cases</li>
+  <li>⚠️ non-atomic config replacement races</li>
+  <li>⚠️ service stop/restart behavior that was too optimistic for busy routers</li>
+  <li>⚠️ compatibility drift with the newer binary’s runtime model</li>
+</ul>
+
+<p>
+This build addresses that layer specifically.
+</p>
+
+<hr/>
+
+<h2 id="openwrt-specific-work">🧠 OpenWrt-specific work</h2>
+
+<p>
+The main work in this project is not “changing telemt internals”, but
+<b>rewriting the OpenWrt service integration so it matches newer telemt versions</b>.
+</p>
+
+<h3>1. Reworked init.d logic</h3>
+
+<p>
+The init script was rewritten to better align with current telemt releases:
+</p>
+
+<ul>
+  <li>✅ cleaner procd integration</li>
+  <li>✅ safer service lifecycle handling</li>
+  <li>✅ explicit TOML generation path</li>
+  <li>✅ OpenWrt-friendly runtime file layout</li>
+  <li>✅ correct handling of API / metrics / listener ports</li>
+  <li>✅ compatibility with newer telemt config fields and runtime expectations</li>
+</ul>
+
+<h3>2. Atomic config updates</h3>
+
+<p>
+Special attention was given to config replacement behavior.
+On OpenWrt, telemt may watch its runtime TOML, and non-atomic recreation can produce short-lived
+missing-file windows. That is unacceptable on a live router.
+</p>
+
+<p>
+The service logic was adjusted to ensure config writes are performed in an
+<b>atomic replace style</b>, minimizing races during reload/restart flows.
+</p>
+
+<h3>3. Better reload semantics</h3>
+
+<p>
+The newer binary supports hot-reload-related workflows more seriously than older builds,
+so the service layer was adapted accordingly.
+The goal is to avoid unnecessary full restarts when only dynamic parts change,
+while still doing a hard restart when core settings really require it.
+</p>
+
+<h3>4. Real-world OpenWrt constraints</h3>
+
+<p>
+This package is made for <b>home routers</b>, not generic servers.
+That means all decisions are shaped by:
+</p>
+
+<ul>
+  <li>📉 limited RAM</li>
+  <li>📦 limited flash space</li>
+  <li>⚙️ BusyBox / ash environments</li>
+  <li>🔁 procd service supervision</li>
+  <li>🌐 NAT / WAN / port-forward realities</li>
+  <li>🧪 practical router admin workflows under root</li>
+</ul>
+
+<hr/>
+
+<h2 id="build-pipeline">🏗️ Build pipeline</h2>
+
+<p>
+The binary is compiled directly from the official upstream repository:
+</p>
+
+<pre><code>telemt/telemt</code></pre>
 
-**Telemt** is a fast, secure, and feature-rich server written in Rust: it fully implements the official Telegram proxy algo and adds many production-ready improvements such as connection pooling, replay protection, detailed statistics, masking from "prying" eyes
+<p>
+The GitHub Actions workflow performs the following steps:
+</p>
 
-[**Telemt Chat in Telegram**](https://t.me/telemtrs)
-
-## NEWS and EMERGENCY
-### ✈️ Telemt 3 is released!
-<table>
-<tr>
-<td width="50%" valign="top">
-
-### 🇷🇺 RU
-
-#### Релиз 3.0.15 — 25 февраля
-
-25 февраля мы выпустили версию **3.0.15**
-
-Мы предполагаем, что она станет завершающей версией поколения 3.0 и уже сейчас мы рассматриваем её как **LTS-кандидата** для версии **3.1.0**!
-
-После нескольких дней детального анализа особенностей работы Middle-End мы спроектировали и реализовали продуманный режим **ротации ME Writer**. Данный режим позволяет поддерживать стабильно высокую производительность в long-run сценариях без возникновения ошибок, связанных с некорректной конфигурацией прокси
-
-Будем рады вашему фидбеку и предложениям по улучшению — особенно в части **статистики** и **UX**
-
-Релиз:  
-[3.0.15](https://github.com/telemt/telemt/releases/tag/3.0.15)
-
----
-
-Если у вас есть компетенции в:
-
-- Асинхронных сетевых приложениях  
-- Анализе трафика  
-- Реверс-инжиниринге  
-- Сетевых расследованиях  
-
-Мы открыты к архитектурным предложениям, идеям и pull requests
-</td>
-<td width="50%" valign="top">
-
-### 🇬🇧 EN
-
-#### Release 3.0.15 — February 25
-
-On February 25, we released version **3.0.15**
-
-We expect this to become the final release of the 3.0 generation and at this point, we already see it as a strong **LTS candidate** for the upcoming **3.1.0** release!
-
-After several days of deep analysis of Middle-End behavior, we designed and implemented a well-engineered **ME Writer rotation mode**. This mode enables sustained high throughput in long-run scenarios while preventing proxy misconfiguration errors
-
-We are looking forward to your feedback and improvement proposals — especially regarding **statistics** and **UX**
-
-Release:  
-[3.0.15](https://github.com/telemt/telemt/releases/tag/3.0.15)
-
----
-
-If you have expertise in:
-
-- Asynchronous network applications  
-- Traffic analysis  
-- Reverse engineering  
-- Network forensics  
-
-We welcome ideas, architectural feedback, and pull requests.
-</td>
-</tr>
-</table>
-
-# Features
-💥 The configuration structure has changed since version 1.1.0.0. change it in your environment!
-
-⚓ Our implementation of **TLS-fronting** is one of the most deeply debugged, focused, advanced and *almost* **"behaviorally consistent to real"**:  we are confident we have it right - [see evidence on our validation and traces](#recognizability-for-dpi-and-crawler)
-
-⚓ Our ***Middle-End Pool*** is fastest by design in standard scenarios, compared to other implementations of connecting to the Middle-End Proxy: non dramatically, but usual
-
-# GOTO
-- [Features](#features)
-- [Quick Start Guide](#quick-start-guide)
-- [How to use?](#how-to-use)
-  - [Systemd Method](#telemt-via-systemd)
-- [Configuration](#configuration)
-  - [Minimal Configuration](#minimal-configuration-for-first-start)
-  - [Advanced](#advanced)
-    - [Adtag](#adtag)
-    - [Listening and Announce IPs](#listening-and-announce-ips)
-    - [Upstream Manager](#upstream-manager)
-      - [IP](#bind-on-ip)
-      - [SOCKS](#socks45-as-upstream)
-- [FAQ](#faq)
-  - [Recognizability for DPI + crawler](#recognizability-for-dpi-and-crawler)
-  - [Telegram Calls](#telegram-calls-via-mtproxy)
-  - [DPI](#how-does-dpi-see-mtproxy-tls)
-  - [Whitelist on Network Level](#whitelist-on-ip)
-  - [Too many open files](#too-many-open-files)
-- [Build](#build)
-- [Docker](#docker)
-- [Why Rust?](#why-rust)
-
-## Features
-
-- Full support for all official MTProto proxy modes:
-  - Classic
-  - Secure - with `dd` prefix
-  - Fake TLS - with `ee` prefix + SNI fronting
-- Replay attack protection
-- Optional traffic masking: forward unrecognized connections to a real web server, e.g. GitHub 🤪
-- Configurable keepalives + timeouts + IPv6 and "Fast Mode"
-- Graceful shutdown on Ctrl+C
-- Extensive logging via `trace` and `debug` with `RUST_LOG` method
-
-## Quick Start Guide
-**This software is designed for Debian-based OS: in addition to Debian, these are Ubuntu, Mint, Kali, MX and many other Linux**
-1. Download release
-```bash
-wget -qO- "https://github.com/telemt/telemt/releases/latest/download/telemt-$(uname -m)-linux-$(ldd --version 2>&1 | grep -iq musl && echo musl || echo gnu).tar.gz" | tar -xz
-```
-2. Move to Bin Folder
-```bash
-mv telemt /bin
-```
-4. Make Executable
-```bash
-chmod +x /bin/telemt
-```
-5. Go to [How to use?](#how-to-use) section for for further steps
-
-## How to use?
-### Telemt via Systemd
-**This instruction "assume" that you:**
-- logged in as root or executed `su -` / `sudo su`
-- you already have an assembled and executable `telemt` in /bin folder as a result of the [Quick Start Guide](#quick-start-guide) or [Build](#build)
-
-**0. Check port and generate secrets**
-
-The port you have selected for use should be MISSING from the list, when:
-```bash
-netstat -lnp
-```
-
-Generate 16 bytes/32 characters HEX with OpenSSL or another way:
-```bash
-openssl rand -hex 16
-```
-OR
-```bash
-xxd -l 16 -p /dev/urandom
-```
-OR
-```bash
-python3 -c 'import os; print(os.urandom(16).hex())'
-```
-
-**1. Place your config to /etc/telemt.toml**
-
-Open nano
-```bash
-nano /etc/telemt.toml
-```
-paste your config from [Configuration](#configuration) section
-
-then Ctrl+X -> Y -> Enter to save
-
-**2. Create service on /etc/systemd/system/telemt.service**
-
-Open nano
-```bash
-nano /etc/systemd/system/telemt.service
-```
-paste this Systemd Module
-```bash
-[Unit]
-Description=Telemt
-After=network.target
-
-[Service]
-Type=simple
-WorkingDirectory=/bin
-ExecStart=/bin/telemt /etc/telemt.toml
-Restart=on-failure
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-```
-then Ctrl+X -> Y -> Enter to save
-
-**3.**  In Shell type `systemctl start telemt` - it must start with zero exit-code
-
-**4.** In Shell type `systemctl status telemt` - there you can reach info about current MTProxy status
-
-**5.** In Shell type `systemctl enable telemt` - then telemt will start with system startup, after the network is up
-
-**6.** In Shell type `journalctl -u telemt -n -g "links" --no-pager -o cat | tac` - get the connection links
-
-## Configuration
-### Minimal Configuration for First Start
-```toml
-# === General Settings ===
-[general]
-# ad_tag = "00000000000000000000000000000000"
-
-[general.modes]
-classic = false
-secure = false
-tls = true
-
-# === Anti-Censorship & Masking ===
-[censorship]
-tls_domain = "petrovich.ru"
-
-[access.users]
-# format: "username" = "32_hex_chars_secret"
-hello = "00000000000000000000000000000000"
-
-```
-### Advanced
-#### Adtag (per-user)
-To use channel advertising and usage statistics from Telegram, get an Adtag from [@mtproxybot](https://t.me/mtproxybot). Set it per user in `[access.user_ad_tags]` (32 hex chars):
-```toml
-[access.user_ad_tags]
-username1 = "11111111111111111111111111111111"  # Replace with your tag from @mtproxybot
-username2 = "22222222222222222222222222222222"
-```
-#### Listening and Announce IPs
-To specify listening address and/or address in links, add to section `[[server.listeners]]` of config.toml:
-```toml
-[[server.listeners]]
-ip = "0.0.0.0"          # 0.0.0.0 = all IPs; your IP = specific listening
-announce_ip = "1.2.3.4" # IP in links; comment with # if not used
-```
-#### Upstream Manager
-To specify upstream, add to section `[[upstreams]]` of config.toml:
-##### Bind on IP
-```toml
-[[upstreams]]
-type = "direct"
-weight = 1
-enabled = true
-interface = "192.168.1.100" # Change to your outgoing IP
-```
-##### SOCKS4/5 as Upstream
-- Without Auth:
-```toml
-[[upstreams]]
-type = "socks5"            # Specify SOCKS4 or SOCKS5
-address = "1.2.3.4:1234"   # SOCKS-server Address
-weight = 1                 # Set Weight for Scenarios
-enabled = true
-```
-
-- With Auth:
-```toml
-[[upstreams]]
-type = "socks5"            # Specify SOCKS4 or SOCKS5
-address = "1.2.3.4:1234"   # SOCKS-server Address
-username = "user"          # Username for Auth on SOCKS-server
-password = "pass"          # Password for Auth on SOCKS-server
-weight = 1                 # Set Weight for Scenarios
-enabled = true
-```
-
-## FAQ
-### Recognizability for DPI and crawler
-Since version 1.1.0.0, we have debugged masking perfectly: for all clients without "presenting" a key, 
-we transparently direct traffic to the target host!
-
-- We consider this a breakthrough aspect, which has no stable analogues today
-- Based on this: if `telemt` configured correctly, **TLS mode is completely identical to real-life handshake + communication** with a specified host
-- Here is our evidence:
-    - 212.220.88.77 - "dummy" host, running `telemt`
-    - `petrovich.ru` - `tls` + `masking` host, in HEX: `706574726f766963682e7275`
-    - **No MITM + No Fake Certificates/Crypto** = pure transparent *TCP Splice* to "best" upstream: MTProxy or tls/mask-host:
-      - DPI see legitimate HTTPS to `tls_host`, including *valid chain-of-trust* and entropy
-      - Crawlers completely satisfied receiving responses from `mask_host`
-  #### Client WITH secret-key accesses the MTProxy resource:
-  
-  <img width="360" height="439" alt="telemt" src="https://github.com/user-attachments/assets/39352afb-4a11-4ecc-9d91-9e8cfb20607d" />
-  
-  #### Client WITHOUT secret-key gets transparent access to the specified resource:
-    - with trusted certificate
-    - with original handshake
-    - with full request-response way
-    - with low-latency overhead
-```bash
-root@debian:~/telemt# curl -v -I --resolve petrovich.ru:443:212.220.88.77 https://petrovich.ru/
-* Added petrovich.ru:443:212.220.88.77 to DNS cache
-* Hostname petrovich.ru was found in DNS cache
-*   Trying 212.220.88.77:443...
-* Connected to petrovich.ru (212.220.88.77) port 443 (#0)
-* ALPN: offers h2,http/1.1
-* TLSv1.3 (OUT), TLS handshake, Client hello (1):
-*  CAfile: /etc/ssl/certs/ca-certificates.crt
-*  CApath: /etc/ssl/certs
-* TLSv1.3 (IN), TLS handshake, Server hello (2):
-* TLSv1.3 (IN), TLS handshake, Encrypted Extensions (8):
-* TLSv1.3 (IN), TLS handshake, Certificate (11):
-* TLSv1.3 (IN), TLS handshake, CERT verify (15):
-* TLSv1.3 (IN), TLS handshake, Finished (20):
-* TLSv1.3 (OUT), TLS change cipher, Change cipher spec (1):
-* TLSv1.3 (OUT), TLS handshake, Finished (20):
-* SSL connection using TLSv1.3 / TLS_AES_256_GCM_SHA384
-* ALPN: server did not agree on a protocol. Uses default.
-* Server certificate:
-*  subject: C=RU; ST=Saint Petersburg; L=Saint Petersburg; O=STD Petrovich; CN=*.petrovich.ru
-*  start date: Jan 28 11:21:01 2025 GMT
-*  expire date: Mar  1 11:21:00 2026 GMT
-*  subjectAltName: host "petrovich.ru" matched cert's "petrovich.ru"
-*  issuer: C=BE; O=GlobalSign nv-sa; CN=GlobalSign RSA OV SSL CA 2018
-*  SSL certificate verify ok.
-* using HTTP/1.x
-> HEAD / HTTP/1.1
-> Host: petrovich.ru
-> User-Agent: curl/7.88.1
-> Accept: */*
-> 
-* TLSv1.3 (IN), TLS handshake, Newsession Ticket (4):
-* TLSv1.3 (IN), TLS handshake, Newsession Ticket (4):
-* old SSL session ID is stale, removing
-< HTTP/1.1 200 OK
-HTTP/1.1 200 OK
-< Server: Variti/0.9.3a
-Server: Variti/0.9.3a
-< Date: Thu, 01 Jan 2026 00:0000 GMT
-Date: Thu, 01 Jan 2026 00:0000 GMT
-< Access-Control-Allow-Origin: *
-Access-Control-Allow-Origin: *
-< Content-Type: text/html
-Content-Type: text/html
-< Cache-Control: no-store
-Cache-Control: no-store
-< Expires: Thu, 01 Jan 2026 00:0000 GMT
-Expires: Thu, 01 Jan 2026 00:0000 GMT
-< Pragma: no-cache
-Pragma: no-cache
-< Set-Cookie: ipp_uid=XXXXX/XXXXX/XXXXX==; Expires=Tue, 31 Dec 2040 23:59:59 GMT; Domain=.petrovich.ru; Path=/
-Set-Cookie: ipp_uid=XXXXX/XXXXX/XXXXX==; Expires=Tue, 31 Dec 2040 23:59:59 GMT; Domain=.petrovich.ru; Path=/
-< Content-Type: text/html
-Content-Type: text/html
-< Content-Length: 31253
-Content-Length: 31253
-< Connection: keep-alive
-Connection: keep-alive
-< Keep-Alive: timeout=60
-Keep-Alive: timeout=60
-
-< 
-* Connection #0 to host petrovich.ru left intact
-
-```
-- We challenged ourselves, we kept trying and we didn't only *beat the air*: now, we have something to show you
-  - Do not just take our word for it? - This is great and we respect that: you can build your own `telemt` or download a build and check it right now
-### Telegram Calls via MTProxy
-- Telegram architecture **does NOT allow calls via MTProxy**, but only via SOCKS5, which cannot be obfuscated
-### How does DPI see MTProxy TLS?
-- DPI sees MTProxy in Fake TLS (ee) mode as TLS 1.3
-- the SNI you specify sends both the client and the server;
-- ALPN is similar to HTTP 1.1/2;
-- high entropy, which is normal for AES-encrypted traffic;
-### Whitelist on IP
-- MTProxy cannot work when there is: 
-  - no IP connectivity to the target host: Russian Whitelist on Mobile Networks - "Белый список"
-  - OR all TCP traffic is blocked
-  - OR high entropy/encrypted traffic is blocked: content filters at universities and critical infrastructure
-  - OR all TLS traffic is blocked
-  - OR specified port is blocked: use 443 to make it "like real"
-  - OR provided SNI is blocked: use "officially approved"/innocuous name
-- like most protocols on the Internet; 
-- these situations are observed:
-  - in China behind the Great Firewall
-  - in Russia on mobile networks, less in wired networks
-  - in Iran during "activity"
-### Too many open files
-- On a fresh Linux install the default open file limit is low; under load `telemt` may fail with `Accept error: Too many open files`
-- **Systemd**: add `LimitNOFILE=65536` to the `[Service]` section (already included in the example above)
-- **Docker**: add `--ulimit nofile=65536:65536` to your `docker run` command, or in `docker-compose.yml`:
-```yaml
-ulimits:
-  nofile:
-    soft: 65536
-    hard: 65536
-```
-- **System-wide** (optional): add to `/etc/security/limits.conf`:
-```
-*       soft    nofile  1048576
-*       hard    nofile  1048576
-root    soft    nofile  1048576
-root    hard    nofile  1048576
-```
-
-
-## Build
-```bash
-# Cloning repo
-git clone https://github.com/telemt/telemt 
-# Changing Directory to telemt
-cd telemt
-# Starting Release Build
-cargo build --release
-# Move to /bin
-mv ./target/release/telemt /bin
-# Make executable
-chmod +x /bin/telemt
-# Lets go!
-telemt config.toml
-```
-
-## Docker
-**Quick start (Docker Compose)**
-
-1. Edit `config.toml` in repo root (at least: port, users secrets, tls_domain)
-2. Start container:
-```bash
-docker compose up -d --build
-```
-3. Check logs:
-```bash
-docker compose logs -f telemt
-```
-4. Stop:
-```bash
-docker compose down
-```
-
-**Notes**
-- `docker-compose.yml` maps `./config.toml` to `/app/config.toml` (read-only)
-- By default it publishes `443:443` and runs with dropped capabilities (only `NET_BIND_SERVICE` is added)
-- If you really need host networking (usually only for some IPv6 setups) uncomment `network_mode: host`
-
-**Run without Compose**
-```bash
-docker build -t telemt:local .
-docker run --name telemt --restart unless-stopped \
-  -p 443:443 \
-  -e RUST_LOG=info \
-  -v "$PWD/config.toml:/app/config.toml:ro" \
-  --read-only \
-  --cap-drop ALL --cap-add NET_BIND_SERVICE \
-  --ulimit nofile=65536:65536 \
-  telemt:local
-```
-
-## Why Rust?
-- Long-running reliability and idempotent behavior
-- Rust's deterministic resource management - RAII 
-- No garbage collector
-- Memory safety and reduced attack surface
-- Tokio's asynchronous architecture
-
-## Issues
-- ✅ [SOCKS5 as Upstream](https://github.com/telemt/telemt/issues/1) -> added Upstream Management
-- ✅ [iOS - Media Upload Hanging-in-Loop](https://github.com/telemt/telemt/issues/2)
-
-## Roadmap
-- Public IP in links
-- Config Reload-on-fly
-- Bind to device or IP for outbound/inbound connections
-- Adtag Support per SNI / Secret
-- Fail-fast on start + Fail-soft on runtime (only WARN/ERROR)
-- Zero-copy, minimal allocs on hotpath
-- DC Healthchecks + global fallback
-- No global mutable state
-- Client isolation + Fair Bandwidth
-- Backpressure-aware IO
-- "Secret Policy" - SNI / Secret Routing :D
-- Multi-upstream Balancer and Failover
-- Strict FSM per handshake
-- Session-based Antireplay with Sliding window, non-broking reconnects
-- Web Control: statistic, state of health, latency, client experience...
+<ol>
+  <li>Fetch target tag or branch</li>
+  <li>Checkout this packaging repository</li>
+  <li>Checkout upstream <code>telemt/telemt</code> sources</li>
+  <li>Install stable Rust toolchain</li>
+  <li>Cross-compile for <code>aarch64-unknown-linux-musl</code></li>
+  <li>Build with size-oriented release settings</li>
+  <li>Compress the resulting binary with <b>UPX</b></li>
+  <li>Append a visible version marker to the binary</li>
+  <li>Normalize OpenWrt shell scripts with <b>dos2unix</b></li>
+  <li>Package final artifacts with <b>nFPM</b> into IPK and APK</li>
+  <li>Publish release assets to GitHub Releases</li>
+</ol>
+
+<h3>Rust release profile choices</h3>
+
+<p>
+The binary is intentionally built in a compact form:
+</p>
+
+<ul>
+  <li><code>opt-level = z</code> 📉</li>
+  <li><code>lto = true</code> 🔗</li>
+  <li><code>codegen-units = 1</code> 🧱</li>
+  <li><code>panic = abort</code> 💥</li>
+  <li><code>strip = true</code> ✂️</li>
+</ul>
+
+<p>
+This keeps the resulting daemon small and router-friendly while still using the official source tree.
+</p>
+
+<hr/>
+
+<h2 id="packages">📁 Packages</h2>
+
+<p>
+Build outputs include:
+</p>
+
+<ul>
+  <li><code>telemt-aarch64-musl</code> — raw standalone binary</li>
+  <li><code>telemt_&lt;version&gt;_aarch64_generic.ipk</code></li>
+  <li><code>telemt_&lt;version&gt;_aarch64_cortex-a53.ipk</code></li>
+  <li><code>telemt_&lt;version&gt;_aarch64_generic.apk</code></li>
+  <li><code>telemt_&lt;version&gt;_aarch64_cortex-a53.apk</code></li>
+</ul>
+
+<p>
+These packages include:
+</p>
+
+<ul>
+  <li><code>/usr/bin/telemt</code></li>
+  <li><code>/etc/init.d/telemt</code></li>
+  <li><code>/etc/config/telemt</code></li>
+</ul>
+
+<hr/>
+
+<h2 id="installation">📥 Installation</h2>
+
+<h3>IPK</h3>
+
+<pre><code>opkg install ./telemt_&lt;version&gt;_aarch64_generic.ipk</code></pre>
+
+<h3>APK</h3>
+
+<pre><code>apk add --allow-untrusted ./telemt_&lt;version&gt;_aarch64_generic.apk</code></pre>
+
+<h3>Service control</h3>
+
+<pre><code>/etc/init.d/telemt enable
+/etc/init.d/telemt start
+/etc/init.d/telemt restart
+/etc/init.d/telemt stop</code></pre>
+
+<hr/>
+
+<h2 id="notes">📝 Notes</h2>
+
+<ul>
+  <li>ℹ️ This repository focuses on the <b>headless daemon package</b></li>
+  <li>ℹ️ LuCI integration is handled separately</li>
+  <li>ℹ️ The binary itself comes from the <b>official upstream telemt repository</b></li>
+  <li>ℹ️ The OpenWrt-specific value here is the <b>service, packaging, and runtime integration layer</b></li>
+</ul>
+
+<p>
+If you want a WebUI, install the companion LuCI application separately.
+</p>
+
+<hr/>
+
+<h2>🎯 Project philosophy</h2>
+
+<p>
+Keep the daemon upstream.<br/>
+Keep the package lightweight.<br/>
+Make the OpenWrt integration correct.
+</p>
+
+<p>
+That is the whole point of this build.
+</p>
+
+<hr/>
+
+<p align="center">
+  Made for OpenWrt routers 🧭<br/>
+  Built from official telemt sources ⚙️<br/>
+  Packaged for practical deployment 📦
+</p>

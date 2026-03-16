@@ -1,16 +1,16 @@
 #!/bin/sh /etc/rc.common
 # ==============================================================================
 # Telemt init.d / procd service script
-# Version: 3.3.16-4
+# Version: 3.3.16-5 — Refactored (phantom ME params removed, public_port added)
 # ==============================================================================
-
 START=99
 STOP=10
 USE_PROCD=1
 
+# CANONICAL PATHS
 CONF=/tmp/etc/telemt.toml
 VER_FILE=/tmp/etc/telemt.version
-MANUAL_STOP_FILE=/tmp/telemt.manual_stop
+MANUAL_STOP=/var/run/telemt.manual_stop
 
 extra_command "run_save_stats" "Force dump prometheus metrics to RAM before shutdown"
 
@@ -41,54 +41,6 @@ fetch_metrics() {
     fi
 }
 
-set_manual_stop() {
-    : > "$MANUAL_STOP_FILE"
-}
-
-clear_manual_stop() {
-    rm -f "$MANUAL_STOP_FILE"
-}
-
-is_manual_stop() {
-    [ -f "$MANUAL_STOP_FILE" ]
-}
-
-get_telemt_pids() {
-    local p
-    for p in $(pidof telemt 2>/dev/null); do
-        if [ "$(cat "/proc/$p/comm" 2>/dev/null)" = "telemt" ]; then
-            echo "$p"
-        fi
-    done
-}
-
-terminate_telemt_pids() {
-    local timeout="${1:-8}"
-    local pids elapsed
-
-    pids="$(get_telemt_pids)"
-    [ -z "$pids" ] && return 0
-
-    for p in $pids; do
-        kill -TERM "$p" 2>/dev/null
-    done
-
-    elapsed=0
-    while [ "$elapsed" -lt "$timeout" ]; do
-        sleep 1
-        pids="$(get_telemt_pids)"
-        [ -z "$pids" ] && return 0
-        elapsed=$((elapsed + 1))
-    done
-
-    for p in $pids; do
-        kill -KILL "$p" 2>/dev/null
-    done
-
-    sleep 1
-    return 0
-}
-
 run_save_stats() {
     local m_port=$(uci -q get telemt.general.metrics_port || echo 9092)
     local tmp_file="/tmp/telemt_stats.txt"
@@ -103,53 +55,29 @@ run_save_stats() {
     done
 
     if [ -z "$pid" ]; then
-        rm -f "$tmp_live" "$tmp_stat"
-        return 0
+        rm -f "$tmp_live" "$tmp_stat"; return 0
     fi
 
-    local raw
-    raw="$(fetch_metrics "http://127.0.0.1:${m_port}/metrics" 2>/dev/null)"
+    local raw=$(fetch_metrics "http://127.0.0.1:${m_port}/metrics" 2>/dev/null)
     if [ -z "$raw" ]; then
-        rm -f "$tmp_live" "$tmp_stat"
-        return 0
+        rm -f "$tmp_live" "$tmp_stat"; return 0
     fi
 
     touch "$tmp_file" 2>/dev/null
 
     echo "$raw" | awk '
-    /^telemt_user_octets_to_client/ {
-        match($0, /user="[^"]+"/)
-        if (RSTART) {
-            u=substr($0, RSTART+6, RLENGTH-7)
-            tx[u]+=$2
-            users[u]=1
-        }
-    }
-    /^telemt_user_octets_from_client/ {
-        match($0, /user="[^"]+"/)
-        if (RSTART) {
-            u=substr($0, RSTART+6, RLENGTH-7)
-            rx[u]+=$2
-            users[u]=1
-        }
-    }
-    END {
-        for (u in users) printf "%s %.0f %.0f\n", u, tx[u], rx[u]
-    }' > "$tmp_live"
+    /^telemt_user_octets_to_client/ { match($0, /user="[^"]+"/); if(RSTART) { u=substr($0, RSTART+6, RLENGTH-7); tx[u]+=$2; users[u]=1 } }
+    /^telemt_user_octets_from_client/ { match($0, /user="[^"]+"/); if(RSTART) { u=substr($0, RSTART+6, RLENGTH-7); rx[u]+=$2; users[u]=1 } }
+    END { for(u in users) printf "%s %.0f %.0f\n", u, tx[u], rx[u] }
+    ' > "$tmp_live"
 
     if [ -s "$tmp_live" ]; then
         cat "$tmp_live" "$tmp_file" 2>/dev/null | awk '
-        NF==3 {
-            tx[$1] += $2
-            rx[$1] += $3
-            users[$1]=1
-        }
-        END {
-            for (u in users) printf "%s %.0f %.0f\n", u, tx[u], rx[u]
-        }' > "$tmp_stat"
+        NF==3 { tx[$1] += $2; rx[$1] += $3; users[$1]=1 }
+        END { for(u in users) printf "%s %.0f %.0f\n", u, tx[u], rx[u] }
+        ' > "$tmp_stat"
         [ -s "$tmp_stat" ] && mv "$tmp_stat" "$tmp_file"
     fi
-
     rm -f "$tmp_live" "$tmp_stat"
 }
 
@@ -158,31 +86,36 @@ generate_toml() {
     local target_file="$1"
     local target_dir target_base
 
+    # Ensure directories exist. Always write to a unique temp file in the same
+    # directory and only replace the target with a single atomic rename.
     mkdir -p /tmp/etc /var/etc
+
     rm -f /var/etc/telemt.toml
 
     target_dir="$(dirname "$target_file")"
     target_base="$(basename "$target_file")"
     mkdir -p "$target_dir"
 
-    local TMP_LINKS TMP_USERS TMP_CONNS TMP_IPS TMP_QUOTA TMP_EXP TMP_CONF
-    TMP_LINKS="$(mktemp /tmp/telemt_links.XXXXXX)"
-    TMP_USERS="$(mktemp /tmp/telemt_users.XXXXXX)"
-    TMP_CONNS="$(mktemp /tmp/telemt_conns.XXXXXX)"
-    TMP_IPS="$(mktemp /tmp/telemt_ips.XXXXXX)"
-    TMP_QUOTA="$(mktemp /tmp/telemt_quota.XXXXXX)"
-    TMP_EXP="$(mktemp /tmp/telemt_exp.XXXXXX)"
-    TMP_CONF="$(mktemp "$target_dir/${target_base}.tmp.XXXXXX")"
+    local TMP_LINKS=$(mktemp /tmp/telemt_links.XXXXXX)
+    local TMP_USERS=$(mktemp /tmp/telemt_users.XXXXXX)
+    local TMP_CONNS=$(mktemp /tmp/telemt_conns.XXXXXX)
+    local TMP_IPS=$(mktemp /tmp/telemt_ips.XXXXXX)
+    local TMP_QUOTA=$(mktemp /tmp/telemt_quota.XXXXXX)
+    local TMP_EXP=$(mktemp /tmp/telemt_exp.XXXXXX)
+    local TMP_CONF=$(mktemp "$target_dir/${target_base}.tmp.XXXXXX")
 
-    cleanup_tmp() {
-        rm -f "$TMP_LINKS" "$TMP_USERS" "$TMP_CONNS" "$TMP_IPS" "$TMP_QUOTA" "$TMP_EXP" "$TMP_CONF"
-    }
+    cleanup_tmp() { rm -f "$TMP_LINKS" "$TMP_USERS" "$TMP_CONNS" "$TMP_IPS" "$TMP_QUOTA" "$TMP_EXP" "$TMP_CONF"; }
 
+    # --- Variable declarations ---
     local mode port api_port metrics_port ext_rt m_alo m_alan metrics_whitelist domain log_level
     local use_mp use_stun ad_tag announce_ip external_ip public_port
     local tm_handshake tm_connect tm_keepalive tm_ack
     local listen_ipv4 listen_ipv6 prefer_ip
     local fake_cert_len tls_full_cert_ttl_secs replay_window_secs ignore_time_skew
+    # PATCH 3.3.16: Removed phantom ME locals:
+    #   me_floor_mode, me_idle_secs, me_grace_secs, me_min_single,
+    #   me_shadow_writers, me_outage_mode, me_outage_no_quarantine, me_shadow_rotate
+    # These were silent-ignored by the Rust TOML parser — the binary self-adapts.
     local me_pool_size me_warm_standby me_update_every hardswap me_drain_ttl auto_deg deg_min_dc
     local desync_all mask_proxy_protocol
 
@@ -199,11 +132,9 @@ generate_toml() {
         api_port=$((metrics_port + 1))
         logger -t telemt "Init: Port conflict detected. Auto-shifted Control API to $api_port"
     fi
-
     if [ "$port" -eq "$api_port" ] || [ "$port" -eq "$metrics_port" ]; then
         logger -t telemt "Init: CRITICAL ERROR! Proxy port conflicts with API/Metrics."
-        cleanup_tmp
-        return 1
+        cleanup_tmp; return 1
     fi
 
     config_get_bool ext_rt general extended_runtime_enabled 1
@@ -213,30 +144,24 @@ generate_toml() {
     config_get domain general domain "google.com"
     config_get external_ip general external_ip ""
     config_get announce_ip general announce_ip ""
-    config_get public_port general public_port ""
 
+    # PATCH 3.3.16: public_port — port shown in tg:// links (critical for NAT scenarios)
+    config_get public_port general public_port ""
     is_uint "$public_port" || public_port=""
 
     config_get log_level general log_level "normal"
-    case "$log_level" in
-        debug|verbose|normal|silent) ;;
-        *) log_level="normal" ;;
-    esac
+    case "$log_level" in debug|verbose|normal|silent) ;; *) log_level="normal" ;; esac
 
     config_get mask_proxy_protocol general mask_proxy_protocol "0"
-    case "$mask_proxy_protocol" in
-        1|2) ;;
-        *) mask_proxy_protocol="0" ;;
-    esac
+    case "$mask_proxy_protocol" in 1|2) ;; *) mask_proxy_protocol="0" ;; esac
 
     config_get prefer_ip general prefer_ip "4"
-    [ "$prefer_ip" = "4" ] || [ "$prefer_ip" = "6" ] || prefer_ip="4"
+    if [ "$prefer_ip" != "4" ] && [ "$prefer_ip" != "6" ]; then prefer_ip="4"; fi
 
-    domain="$(echo "$domain" | tr -cd 'A-Za-z0-9.-')"
+    domain=$(echo "$domain" | tr -cd 'A-Za-z0-9.-')
     [ -z "$domain" ] && domain="google.com"
-
-    announce_ip="$(echo "$announce_ip" | tr -cd 'A-Za-z0-9.-')"
-    external_ip="$(echo "$external_ip" | awk '{print $1}' | tr -cd 'A-Za-z0-9.-')"
+    announce_ip=$(echo "$announce_ip" | tr -cd 'A-Za-z0-9.-')
+    external_ip=$(echo "$external_ip" | awk '{print $1}' | tr -cd 'A-Za-z0-9.-')
     [ -z "$announce_ip" ] && announce_ip="$external_ip"
 
     config_get_bool listen_ipv4 general listen_ipv4 1
@@ -248,6 +173,7 @@ generate_toml() {
     config_get_bool use_mp general use_middle_proxy 0
     config_get_bool use_stun general use_stun 0
 
+    # Read ME options only if ME is enabled — avoids polluting TOML with garbage defaults
     if [ "$use_mp" -eq 1 ]; then
         config_get me_pool_size general me_pool_size "16"
         config_get me_warm_standby general me_warm_standby "8"
@@ -256,6 +182,14 @@ generate_toml() {
         config_get me_drain_ttl general me_drain_ttl "90"
         config_get_bool auto_deg general auto_degradation 1
         config_get deg_min_dc general degradation_min_dc "2"
+        # PATCH 3.3.16: Removed phantom config_get calls:
+        #   me_adaptive_floor_idle_secs, me_adaptive_floor_recover_grace_secs,
+        #   me_adaptive_floor_min_writers_single_endpoint,
+        #   me_single_endpoint_shadow_writers, me_single_endpoint_outage_mode_enabled,
+        #   me_single_endpoint_outage_disable_quarantine,
+        #   me_single_endpoint_shadow_rotate_every_secs
+        # Reason: binary v3.3.16+ self-tunes these; they are Read-Only API state,
+        #         NOT TOML config keys. Parser silently ignored them previously.
     fi
 
     config_get_bool desync_all general desync_all_full 0
@@ -265,53 +199,40 @@ generate_toml() {
     config_get replay_window_secs general replay_window_secs "1800"
     config_get_bool ignore_time_skew general ignore_time_skew 0
 
-    ad_tag="$(sanitize_toml_value "$ad_tag" | tr -cd 'A-Fa-f0-9')"
+    ad_tag=$(sanitize_toml_value "$ad_tag" | tr -cd 'A-Fa-f0-9')
 
-    local mp_str="false"
-    local stun_str="false"
-    local v4_str="false"
-    local v6_str="false"
-    local time_skew_str="false"
-    local hardswap_str="false"
-    local auto_deg_str="false"
-    local api_str="false"
-    local minimal_rt_str="false"
+    local mp_str="false";       [ "$use_mp" -eq 1 ]          && mp_str="true"
+    local stun_str="false";     [ "$use_stun" -eq 1 ]         && stun_str="true"
+    local v4_str="false";       [ "$listen_ipv4" -eq 1 ]      && v4_str="true"
+    local v6_str="false";       [ "$listen_ipv6" -eq 1 ]      && v6_str="true"
+    local time_skew_str="false";[ "$ignore_time_skew" -eq 1 ] && time_skew_str="true"
+    local hardswap_str="false"; [ "${hardswap:-0}" -eq 1 ]    && hardswap_str="true"
+    local auto_deg_str="false"; [ "${auto_deg:-0}" -eq 1 ]    && auto_deg_str="true"
+    local api_str="false";      [ "$ext_rt" -eq 1 ]           && api_str="true"
+    local minimal_rt_str="false"; [ "$ext_rt" -eq 1 ]         && minimal_rt_str="true"
 
-    [ "$use_mp" -eq 1 ] && mp_str="true"
-    [ "$use_stun" -eq 1 ] && stun_str="true"
-    [ "$listen_ipv4" -eq 1 ] && v4_str="true"
-    [ "$listen_ipv6" -eq 1 ] && v6_str="true"
-    [ "$ignore_time_skew" -eq 1 ] && time_skew_str="true"
-    [ "${hardswap:-0}" -eq 1 ] && hardswap_str="true"
-    [ "${auto_deg:-0}" -eq 1 ] && auto_deg_str="true"
-    [ "$ext_rt" -eq 1 ] && api_str="true"
-    [ "$ext_rt" -eq 1 ] && minimal_rt_str="true"
-
-    local m_cls="false"
-    local m_sec="false"
-    local m_tls="false"
+    local m_cls="false"; local m_sec="false"; local m_tls="false"
     case "$mode" in
-        classic) m_cls="true" ;;
-        dd)      m_sec="true" ;;
-        all)     m_cls="true"; m_sec="true"; m_tls="true" ;;
-        *)       m_tls="true" ;;
+        "classic") m_cls="true" ;;
+        "dd")      m_sec="true" ;;
+        "all")     m_cls="true"; m_sec="true"; m_tls="true" ;;
+        *)         m_tls="true" ;;
     esac
 
+    # --- Metrics whitelist CIDR builder ---
     local wl_toml=""
     [ "$m_alo" -eq 1 ] && wl_toml="\"127.0.0.1/32\", \"::1/128\""
 
     if [ "$m_alan" -eq 1 ]; then
-        local lan_ip lan_mask
-        lan_ip="$(uci -q get network.lan.ipaddr)"
+        local lan_ip=$(uci -q get network.lan.ipaddr)
         if [ -z "$lan_ip" ]; then
-            lan_ip="$(ubus call network.interface.lan status 2>/dev/null | grep -A2 'ipv4-address' | grep address | awk -F'"' '{print $4}')"
-            lan_mask="$(ubus call network.interface.lan status 2>/dev/null | grep -A2 'ipv4-address' | grep mask | awk '{print $2}' | tr -d ',')"
+            lan_ip=$(ubus call network.interface.lan status 2>/dev/null | grep -A2 'ipv4-address' | grep address | awk -F'"' '{print $4}')
+            local lan_mask=$(ubus call network.interface.lan status 2>/dev/null | grep -A2 'ipv4-address' | grep mask | awk '{print $2}' | tr -d ',')
         else
-            lan_mask="$(uci -q get network.lan.netmask)"
+            local lan_mask=$(uci -q get network.lan.netmask)
         fi
-
         if [ -n "$lan_ip" ] && [ -n "$lan_mask" ] && [ -x /bin/ipcalc.sh ]; then
-            eval "$(/bin/ipcalc.sh "$lan_ip" "$lan_mask" 2>/dev/null)"
+            eval $(/bin/ipcalc.sh "$lan_ip" "$lan_mask" 2>/dev/null)
             if [ -n "$NETWORK" ] && [ -n "$PREFIX" ]; then
                 if ! echo "$wl_toml" | grep -q "\"$NETWORK/$PREFIX\""; then
                     [ -n "$wl_toml" ] && wl_toml="${wl_toml}, "
@@ -321,15 +242,11 @@ generate_toml() {
         fi
     fi
 
-    local raw ip
     for raw in $(echo "$metrics_whitelist" | tr ',' ' '); do
         ip="$(echo "$raw" | tr -d ' \t\r\n')"
         [ -z "$ip" ] && continue
-        if echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
-            ip="$ip/32"
-        elif echo "$ip" | grep -qE '^[0-9A-Fa-f:]+$'; then
-            ip="$ip/128"
-        fi
+        if echo "$ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then ip="$ip/32"
+        elif echo "$ip" | grep -qE '^[0-9A-Fa-f:]+$'; then ip="$ip/128"; fi
         if is_cidr "$ip"; then
             if ! echo "$wl_toml" | grep -q "\"$ip\""; then
                 [ -n "$wl_toml" ] && wl_toml="${wl_toml}, "
@@ -338,6 +255,7 @@ generate_toml() {
         fi
     done
 
+    # --- Static TOML header ---
     cat <<TOML > "$TMP_CONF"
 [network]
 ipv4 = $v4_str
@@ -358,6 +276,7 @@ use_middle_proxy = $mp_str
 log_level = "$log_level"
 TOML
 
+    # --- ME block (only when enabled) ---
     if [ "$use_mp" -eq 1 ]; then
         [ -n "$ad_tag" ] && echo "ad_tag = \"$ad_tag\"" >> "$TMP_CONF"
         cat <<TOML >> "$TMP_CONF"
@@ -370,14 +289,22 @@ update_every = $me_update_every
 proxy_secret_path = "/var/etc/telemt/proxy-secret"
 proxy_config_v4_cache_path = "/var/etc/telemt/proxy-config-v4.txt"
 proxy_config_v6_cache_path = "/var/etc/telemt/proxy-config-v6.txt"
+# PATCH 3.3.16: renamed me2dc_fallback → auto_degradation_enabled (correct TOML key)
 auto_degradation_enabled = $auto_deg_str
+# PATCH 3.3.16: added previously missing TOML key for min DC threshold
 degradation_min_unavailable_dc_groups = $deg_min_dc
 TOML
+        # PATCH 3.3.16: REMOVED phantom keys:
+        #   floor_mode, adaptive_floor_idle_secs, adaptive_floor_recover_grace_secs,
+        #   adaptive_floor_min_writers_single_endpoint, me_single_endpoint_shadow_writers,
+        #   me_single_endpoint_outage_mode_enabled, me_single_endpoint_outage_disable_quarantine,
+        #   me_single_endpoint_shadow_rotate_every_secs
+        # The binary self-adapts these values; they appear in /v1/limits/effective as Read-Only.
     else
         [ -n "$ad_tag" ] && echo "ad_tag = \"$ad_tag\"" >> "$TMP_CONF"
     fi
 
-    [ "$desync_all" -eq 1 ] && echo "desync_all_full = true" >> "$TMP_CONF"
+    if [ "$desync_all" -eq 1 ]; then echo "desync_all_full = true" >> "$TMP_CONF"; fi
 
     mkdir -p /var/etc/telemt_tlsfront /var/etc/telemt
 
@@ -392,6 +319,12 @@ tls = $m_tls
 port = $port
 metrics_port = $metrics_port
 metrics_whitelist = [$wl_toml]
+TOML
+
+    # [server.api] must come before [[server.listeners]].
+    # In toml-rs (Rust parser), an array-of-tables header resets the "current table"
+    # context, causing any subsequent [server.X] to be scoped under the last array entry.
+    cat <<TOML >> "$TMP_CONF"
 
 [server.api]
 enabled = $api_str
@@ -399,19 +332,20 @@ listen = "0.0.0.0:${api_port}"
 whitelist = [$wl_toml]
 minimal_runtime_enabled = $minimal_rt_str
 minimal_runtime_cache_ttl_ms = 1000
+# explicit contract: LuCI and API clients must be able to mutate users
 read_only = false
 TOML
 
+    # [[server.listeners]] MUST come after all [server.*] sub-tables (toml-rs ordering constraint)
     if [ "$listen_ipv4" -eq 1 ]; then
         echo "[[server.listeners]]" >> "$TMP_CONF"
         echo "ip = \"0.0.0.0\"" >> "$TMP_CONF"
-        [ -n "$announce_ip" ] && echo "announce = \"$announce_ip\"" >> "$TMP_CONF"
+        if [ -n "$announce_ip" ]; then echo "announce = \"$announce_ip\"" >> "$TMP_CONF"; fi
     fi
-
     if [ "$listen_ipv6" -eq 1 ]; then
         echo "[[server.listeners]]" >> "$TMP_CONF"
         echo "ip = \"::\"" >> "$TMP_CONF"
-        [ -n "$announce_ip" ] && echo "announce = \"$announce_ip\"" >> "$TMP_CONF"
+        if [ -n "$announce_ip" ]; then echo "announce = \"$announce_ip\"" >> "$TMP_CONF"; fi
     fi
 
     cat <<TOML >> "$TMP_CONF"
@@ -438,75 +372,47 @@ replay_window_secs = $replay_window_secs
 ignore_time_skew = $time_skew_str
 TOML
 
+    # --- DYNAMIC CONFIG (users, links, upstreams) ---
+    # NOTE: Marker used by reload_service() for hot-reload diff
     echo "# --- DYNAMIC CONFIG ---" >> "$TMP_CONF"
 
-    is_user_enabled() {
-        local en
-        config_get_bool en "$1" enabled 1
-        [ "$en" -eq 1 ]
-    }
-
-    add_user_link() {
-        is_user_enabled "$1" || return 0
-        printf '"%s", ' "$1" >> "$TMP_LINKS"
-    }
-
-    add_user_secret() {
-        is_user_enabled "$1" || return 0
-        local sec
-        config_get sec "$1" secret
-        [ -n "$sec" ] && echo "$1 = \"$sec\"" >> "$TMP_USERS"
-    }
-
-    add_user_conns() {
-        is_user_enabled "$1" || return 0
-        local c
-        config_get c "$1" max_tcp_conns
-        [ -n "$c" ] && [ "$c" != "unlimited" ] && is_uint "$c" && echo "$1 = $c" >> "$TMP_CONNS"
-    }
-
-    add_user_unique_ips() {
-        is_user_enabled "$1" || return 0
-        local i
-        config_get i "$1" max_unique_ips
-        [ -n "$i" ] && [ "$i" != "unlimited" ] && is_uint "$i" && echo "$1 = $i" >> "$TMP_IPS"
-    }
-
+    is_user_enabled() { local en; config_get_bool en "$1" enabled 1; [ "$en" -eq 1 ]; }
+    add_user_link()     { is_user_enabled "$1" || return 0; printf '"%s", ' "$1" >> "$TMP_LINKS"; }
+    add_user_secret()   { is_user_enabled "$1" || return 0; local sec; config_get sec "$1" secret; [ -n "$sec" ] && echo "$1 = \"$sec\"" >> "$TMP_USERS"; }
+    add_user_conns()    { is_user_enabled "$1" || return 0; local c; config_get c "$1" max_tcp_conns; [ -n "$c" ] && [ "$c" != "unlimited" ] && is_uint "$c" && echo "$1 = $c" >> "$TMP_CONNS"; }
+    add_user_unique_ips() { is_user_enabled "$1" || return 0; local i; config_get i "$1" max_unique_ips; [ -n "$i" ] && [ "$i" != "unlimited" ] && is_uint "$i" && echo "$1 = $i" >> "$TMP_IPS"; }
     add_user_quota() {
         is_user_enabled "$1" || return 0
-        local q b
-        config_get q "$1" data_quota
+        local q; config_get q "$1" data_quota
         if [ -n "$q" ] && [ "$q" != "unlimited" ]; then
             if echo "$q" | grep -qE '^[0-9]+([.,][0-9]+)?$'; then
-                b="$(echo "$q" | sed 's/,/\./g' | awk '{printf "%.0f", $1 * 1073741824}')"
-                if [ -n "$b" ] && is_uint "$b" && [ "$b" -gt 0 ]; then
-                    echo "$1 = $b" >> "$TMP_QUOTA"
-                fi
+                local b=$(echo "$q" | sed 's/,/\./g' | awk '{printf "%.0f", $1 * 1073741824}')
+                if [ -n "$b" ] && is_uint "$b" && [ "$b" -gt 0 ]; then echo "$1 = $b" >> "$TMP_QUOTA"; fi
             fi
         fi
     }
-
     add_user_expiration() {
         is_user_enabled "$1" || return 0
-        local exp fmt
-        config_get exp "$1" expire_date
+        local exp; config_get exp "$1" expire_date
         if [ -n "$exp" ] && [ "$exp" != "unlimited" ]; then
-            fmt="$(echo "$exp" | awk -F'[. :]' 'NF==5 {printf "%04d-%02d-%02dT%02d:%02d:00Z", $3, $2, $1, $4, $5}')"
+            local fmt=$(echo "$exp" | awk -F'[. :]' 'NF==5 {printf "%04d-%02d-%02dT%02d:%02d:00Z", $3, $2, $1, $4, $5}')
             [ -n "$fmt" ] && echo "$1 = \"$fmt\"" >> "$TMP_EXP"
         fi
     }
 
     config_foreach add_user_link user
-
     local links_str=""
     if [ -s "$TMP_LINKS" ]; then
-        links_str="$(sed 's/, $//' "$TMP_LINKS")"
+        links_str=$(sed 's/, $//' "$TMP_LINKS")
         printf '\n[general.links]\nshow = [%s]\n' "$links_str" >> "$TMP_CONF"
     else
         printf '\n[general.links]\nshow = "*"\n' >> "$TMP_CONF"
     fi
 
+    # public_host: the IP/domain shown in tg:// links
     [ -n "$announce_ip" ] && printf 'public_host = "%s"\n' "$announce_ip" >> "$TMP_CONF"
+    # PATCH 3.3.16: public_port — external port for tg:// links (critical under NAT/port-mapping)
+    # Example: router listens on :8443 internally, ISP maps it to :443 externally.
     [ -n "$public_port" ] && printf 'public_port = %s\n' "$public_port" >> "$TMP_CONF"
 
     printf '\n[access.users]\n' >> "$TMP_CONF"
@@ -514,31 +420,19 @@ TOML
     [ -s "$TMP_USERS" ] && cat "$TMP_USERS" >> "$TMP_CONF"
 
     config_foreach add_user_conns user
-    if [ -s "$TMP_CONNS" ]; then
-        printf '\n[access.user_max_tcp_conns]\n' >> "$TMP_CONF"
-        cat "$TMP_CONNS" >> "$TMP_CONF"
-    fi
+    if [ -s "$TMP_CONNS" ]; then printf '\n[access.user_max_tcp_conns]\n' >> "$TMP_CONF"; cat "$TMP_CONNS" >> "$TMP_CONF"; fi
 
     config_foreach add_user_unique_ips user
-    if [ -s "$TMP_IPS" ]; then
-        printf '\n[access.user_max_unique_ips]\n' >> "$TMP_CONF"
-        cat "$TMP_IPS" >> "$TMP_CONF"
-    fi
+    if [ -s "$TMP_IPS" ]; then printf '\n[access.user_max_unique_ips]\n' >> "$TMP_CONF"; cat "$TMP_IPS" >> "$TMP_CONF"; fi
 
     config_foreach add_user_quota user
-    if [ -s "$TMP_QUOTA" ]; then
-        printf '\n[access.user_data_quota]\n' >> "$TMP_CONF"
-        cat "$TMP_QUOTA" >> "$TMP_CONF"
-    fi
+    if [ -s "$TMP_QUOTA" ]; then printf '\n[access.user_data_quota]\n' >> "$TMP_CONF"; cat "$TMP_QUOTA" >> "$TMP_CONF"; fi
 
     config_foreach add_user_expiration user
-    if [ -s "$TMP_EXP" ]; then
-        printf '\n[access.user_expirations]\n' >> "$TMP_CONF"
-        cat "$TMP_EXP" >> "$TMP_CONF"
-    fi
+    if [ -s "$TMP_EXP" ]; then printf '\n[access.user_expirations]\n' >> "$TMP_CONF"; cat "$TMP_EXP" >> "$TMP_CONF"; fi
 
+    # --- Upstreams ---
     local has_upstreams=0
-
     handle_upstream() {
         local s="$1"
         local u_en u_type u_addr u_user u_pass u_weight u_scopes u_interface
@@ -557,9 +451,9 @@ TOML
         fi
 
         printf '\n[[upstreams]]\n' >> "$TMP_CONF"
-        echo "type = \"$u_type\"" >> "$TMP_CONF"
-        echo "weight = $u_weight" >> "$TMP_CONF"
-        echo "enabled = true" >> "$TMP_CONF"
+        echo "type = \"$u_type\""     >> "$TMP_CONF"
+        echo "weight = $u_weight"     >> "$TMP_CONF"
+        echo "enabled = true"         >> "$TMP_CONF"
 
         [ -n "$u_scopes" ] && echo "scopes = \"$(sanitize_toml_value "$u_scopes")\"" >> "$TMP_CONF"
 
@@ -572,12 +466,11 @@ TOML
         elif [ -n "$u_interface" ]; then
             echo "interface = \"$(sanitize_toml_value "$u_interface")\"" >> "$TMP_CONF"
         fi
-
         has_upstreams=1
     }
-
     config_foreach handle_upstream upstream
 
+    # Fallback: always ensure at least one direct upstream exists
     if [ "$has_upstreams" -eq 0 ]; then
         printf '\n[[upstreams]]\ntype = "direct"\nenabled = true\nweight = 10\n' >> "$TMP_CONF"
     fi
@@ -586,9 +479,44 @@ TOML
         cleanup_tmp
         return 1
     fi
-
     cleanup_tmp
-    return 0
+}
+
+# ------------------------------------------------------------------------------
+get_telemt_pids() {
+    local p comm out=""
+    for p in $(pidof telemt 2>/dev/null); do
+        comm=$(cat "/proc/$p/comm" 2>/dev/null)
+        [ "$comm" = "telemt" ] || continue
+        out="$out $p"
+    done
+    echo "$out" | sed 's/^ *//'
+}
+
+wait_telemt_pids_gone() {
+    local timeout="$1"
+    local i p alive
+    i=0
+    while [ "$i" -lt "$timeout" ]; do
+        alive=0
+        for p in $(get_telemt_pids); do
+            if kill -0 "$p" 2>/dev/null; then
+                alive=1
+                break
+            fi
+        done
+        [ "$alive" -eq 0 ] && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+force_kill_telemt() {
+    local p
+    for p in $(get_telemt_pids); do
+        kill -KILL "$p" 2>/dev/null
+    done
 }
 
 # ------------------------------------------------------------------------------
@@ -598,14 +526,7 @@ start_service() {
 
     local enabled
     config_get_bool enabled general enabled 0
-    if [ "$enabled" -ne 1 ]; then
-        return 0
-    fi
-
-    if is_manual_stop; then
-        logger -t telemt "Init: manual stop flag is set, skipping start"
-        return 0
-    fi
+    if [ "$enabled" -ne 1 ]; then return 0; fi
 
     if [ ! -x "$PROG" ]; then
         logger -t telemt "Init: CRITICAL ERROR! Binary not found or not executable at $PROG"
@@ -614,11 +535,17 @@ start_service() {
 
     mkdir -p /tmp/etc /var/etc
 
+    if [ -f "$MANUAL_STOP" ]; then
+        logger -t telemt "Init: manual stop flag is set. Refusing automatic start."
+        return 0
+    fi
+
+    # Smart Version detection (waterfall: --version → -V → strings → grep)
     local ver=""
-    ver="$("$PROG" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
-    [ -z "$ver" ] && ver="$("$PROG" -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)"
-    [ -z "$ver" ] && command -v strings >/dev/null 2>&1 && ver="$(strings "$PROG" 2>/dev/null | grep -iE '^MTProxy v' | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
-    [ -z "$ver" ] && ver="$(grep -a -m 1 -ioE 'MTProxy v[0-9]+\.[0-9]+\.[0-9]+' "$PROG" 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')"
+    ver=$("$PROG" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    [ -z "$ver" ] && ver=$("$PROG" -V 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1)
+    [ -z "$ver" ] && command -v strings >/dev/null 2>&1 && ver=$(strings "$PROG" 2>/dev/null | grep -iE '^MTProxy v' | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    [ -z "$ver" ] && ver=$(grep -a -m 1 -ioE 'MTProxy v[0-9]+\.[0-9]+\.[0-9]+' "$PROG" 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 
     if [ -n "$ver" ]; then
         echo "$ver" > "$VER_FILE"
@@ -631,6 +558,7 @@ start_service() {
     fi
     chmod 600 "$CONF"
 
+    # Debug tracer: log effective ME mode to syslog
     logger -t telemt "Init: using config $CONF"
     if grep -q '^use_middle_proxy = true' "$CONF"; then
         logger -t telemt "Init: TOML says ME=ON"
@@ -664,7 +592,6 @@ start_service() {
         json_close_array
         procd_close_data
     fi
-
     procd_close_instance
 }
 
@@ -676,7 +603,7 @@ reload_service() {
     local enabled
     config_get_bool enabled general enabled 0
     if [ "$enabled" -ne 1 ]; then
-        stop
+        /etc/init.d/telemt stop
         return 0
     fi
 
@@ -688,8 +615,12 @@ reload_service() {
     fi
     chmod 600 "$NEW_CONF"
 
+    # Hot-reload diff: compare static (core) sections only.
+    # Dynamic section (users/upstreams) starts at "# --- DYNAMIC CONFIG ---".
+    # If core is unchanged → swap file and signal daemon (no connection drops).
+    # If core changed     → full restart.
     sed -n '1,/^# --- DYNAMIC CONFIG ---/p' "$CONF" 2>/dev/null > /tmp/etc/telemt_core.old
-    sed -n '1,/^# --- DYNAMIC CONFIG ---/p' "$NEW_CONF" > /tmp/etc/telemt_core.new
+    sed -n '1,/^# --- DYNAMIC CONFIG ---/p' "$NEW_CONF"          > /tmp/etc/telemt_core.new
 
     if cmp -s /tmp/etc/telemt_core.old /tmp/etc/telemt_core.new; then
         mv "$NEW_CONF" "$CONF"
@@ -706,25 +637,42 @@ reload_service() {
 # ------------------------------------------------------------------------------
 stop_service() {
     [ "$TELEMT_NO_SAVE" != "1" ] && run_save_stats
-    terminate_telemt_pids 8
+    : > "$MANUAL_STOP"
+
+    # Graceful daemon shutdown: SIGTERM first, then wait, then SIGKILL if needed.
+    local p
+    for p in $(get_telemt_pids); do
+        kill -TERM "$p" 2>/dev/null
+    done
+
+    if ! wait_telemt_pids_gone 3; then
+        force_kill_telemt
+        wait_telemt_pids_gone 2
+    fi
 }
 
 # ------------------------------------------------------------------------------
 start() {
-    clear_manual_stop
-    start_service
+    rm -f "$MANUAL_STOP"
+    rc_procd start_service "$@"
 }
 
+# ------------------------------------------------------------------------------
 stop() {
-    set_manual_stop
-    stop_service
+    rc_procd stop_service "$@"
 }
 
+# ------------------------------------------------------------------------------
 restart() {
-    clear_manual_stop
+    rm -f "$MANUAL_STOP"
+
     TELEMT_NO_SAVE=1 stop_service
-    terminate_telemt_pids 8
-    start_service
+    if ! wait_telemt_pids_gone 1; then
+        force_kill_telemt
+        wait_telemt_pids_gone 2
+    fi
+
+    rc_procd start_service "$@"
 }
 
 # ------------------------------------------------------------------------------

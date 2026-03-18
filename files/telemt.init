@@ -1,7 +1,7 @@
 #!/bin/sh /etc/rc.common
 # ==============================================================================
 # Telemt init.d / procd service script
-# Version: 3.3.16-10 — bot-safe kill (cmdline check), no killall
+# Version: 3.3.22 — bot-safe kill (cmdline check), no killall
 # ==============================================================================
 START=99
 STOP=10
@@ -108,7 +108,7 @@ generate_toml() {
 
     # --- Variable declarations ---
     local mode port api_port metrics_port ext_rt m_alo m_alan metrics_whitelist domain log_level
-    local use_mp use_stun ad_tag announce_ip external_ip public_port
+    local use_mp use_stun ad_tag announce_ip external_ip public_port data_path
     local tm_handshake tm_connect tm_keepalive tm_ack
     local listen_ipv4 listen_ipv6 prefer_ip
     local fake_cert_len tls_full_cert_ttl_secs replay_window_secs ignore_time_skew
@@ -148,6 +148,9 @@ generate_toml() {
     # PATCH 3.3.16: public_port — port shown in tg:// links (critical for NAT scenarios)
     config_get public_port general public_port ""
     is_uint "$public_port" || public_port=""
+
+    # PATCH 3.3.22: data_path — runtime data directory (useful for embedded/read-only rootfs)
+    config_get data_path general data_path ""
 
     config_get log_level general log_level "normal"
     case "$log_level" in debug|verbose|normal|silent) ;; *) log_level="normal" ;; esac
@@ -275,6 +278,12 @@ fast_mode = true
 use_middle_proxy = $mp_str
 log_level = "$log_level"
 TOML
+
+    # PATCH 3.3.22: data_path — runtime data directory
+    [ -n "$data_path" ] && {
+        mkdir -p "$data_path" 2>/dev/null
+        printf 'data_path = "%s"\n' "$data_path" >> "$TMP_CONF"
+    }
 
     # --- ME block (only when enabled) ---
     if [ "$use_mp" -eq 1 ]; then

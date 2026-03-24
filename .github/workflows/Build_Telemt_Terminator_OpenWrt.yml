@@ -20,47 +20,17 @@ jobs:
       PKG_VERSION: ${{ github.event.inputs.version }}
 
     steps:
-      - name: Checkout (tun2proxy for udpgw-server)
+      - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          repository: tun2proxy/tun2proxy
-          ref: master
-          path: src
-          fetch-depth: 1
-
-      - name: Setup Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-musl
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src
 
       - name: Install Dependencies
         run: |
+          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y musl-tools upx-ucl ar
-          cargo install cross --locked --version 0.2.5
-          NFPM_VER="2.43.1"
+          sudo apt-get install -y ca-certificates curl tar gzip xz-utils
+          NFPM_VER="2.45.2"
           curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VER}/nfpm_${NFPM_VER}_Linux_x86_64.tar.gz" | tar -xz
           sudo install -m 0755 nfpm /usr/local/bin/nfpm
-
-      - name: Build tun2proxy-bin (aarch64 musl static)
-        working-directory: src
-        env:
-          CARGO_PROFILE_RELEASE_OPT_LEVEL: z
-          CARGO_PROFILE_RELEASE_LTO: fat
-          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
-          CARGO_PROFILE_RELEASE_PANIC: abort
-          CARGO_PROFILE_RELEASE_STRIP: symbols
-          RUSTFLAGS: -C strip=symbols -C debuginfo=0
-        run: |
-          set -euxo pipefail
-          cross build --release --target aarch64-unknown-linux-musl --bin tun2proxy-bin
-          upx --best --lzma target/aarch64-unknown-linux-musl/release/tun2proxy-bin || true
-          install -m 0755 target/aarch64-unknown-linux-musl/release/tun2proxy-bin "${GITHUB_WORKSPACE}/tun2proxy-bin"
 
       - name: Generate Package Content
         run: |
@@ -68,24 +38,25 @@ jobs:
           PKGROOT="${GITHUB_WORKSPACE}/pkgroot"
           mkdir -p "${PKGROOT}/usr/bin"
 
-          install -m 0755 tun2proxy-bin "${PKGROOT}/usr/bin/tun2proxy"
-
-          # ---- Cleanup script (POSIX sh, BusyBox-compatible) ----
           cat > "${PKGROOT}/usr/bin/telemt-cleanup.sh" <<'CLEANUP'
           #!/bin/sh
           # Telemt Terminator — one-shot cleanup
 
           printf '[*] Telemt Terminator: stopping services...\n'
-          [ -x /etc/init.d/telemt ]    && /etc/init.d/telemt stop    2>/dev/null
-          [ -x /etc/init.d/telemt-bot ] && /etc/init.d/telemt-bot stop 2>/dev/null
+          [ -x /etc/init.d/telemt ] && /etc/init.d/telemt stop 2>/dev/null || true
+          [ -x /etc/init.d/telemt-bot ] && /etc/init.d/telemt-bot stop 2>/dev/null || true
 
           printf '[*] Removing packages...\n'
-          opkg remove luci-app-telemt telemt telemt_wrt telemt-bot \
-            --autoremove --force-removal-of-dependent-packages 2>/dev/null || true
+          if command -v opkg >/dev/null 2>&1; then
+            opkg remove luci-app-telemt telemt telemt_wrt telemt-bot \
+              --autoremove --force-removal-of-dependent-packages 2>/dev/null || true
+          elif command -v apk >/dev/null 2>&1; then
+            apk del luci-app-telemt telemt telemt_wrt telemt-bot 2>/dev/null || true
+          fi
 
           printf '[*] Killing remaining processes...\n'
-          P=$(pidof telemt);    [ -n "$P" ] && killall -9 telemt    2>/dev/null
-          P=$(pidof telemt-bot); [ -n "$P" ] && killall -9 telemt-bot 2>/dev/null
+          P="$(pidof telemt 2>/dev/null || true)"; [ -n "$P" ] && killall -9 telemt 2>/dev/null || true
+          P="$(pidof telemt-bot 2>/dev/null || true)"; [ -n "$P" ] && killall -9 telemt-bot 2>/dev/null || true
 
           printf '[*] Purging files...\n'
           for f in \
@@ -124,48 +95,56 @@ jobs:
             [ -e "$f" ] && rm -f "$f"
           done
 
-          rm -rf /tmp/luci-modulecache/* /tmp/luci-indexcache/* 2>/dev/null
+          rm -rf /tmp/luci-modulecache/* /tmp/luci-indexcache/* 2>/dev/null || true
 
-          [ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd restart 2>/dev/null
-          [ -x /etc/init.d/rpcd ]   && /etc/init.d/rpcd restart   2>/dev/null
+          [ -x /etc/init.d/uhttpd ] && /etc/init.d/uhttpd restart 2>/dev/null || true
+          [ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd restart 2>/dev/null || true
 
           printf '[OK] Telemt removed. System clean.\n'
           CLEANUP
+
           chmod 0755 "${PKGROOT}/usr/bin/telemt-cleanup.sh"
 
-      - name: Create nFPM configs and build ipk + apk
+      - name: Create nFPM configs and build IPK + APK
         run: |
           set -euxo pipefail
           mkdir -p packaging
 
-          # ---- postinst: run cleanup, schedule self-removal ----
           cat > packaging/postinst <<'POSTINST'
           #!/bin/sh
           [ -n "${IPKG_INSTROOT}" ] && exit 0
-          /usr/bin/telemt-cleanup.sh
-          rm -f /tmp/luci-indexcache /tmp/luci-modulecache
-          ( sleep 10 && opkg remove telemt-terminator 2>/dev/null ) &
+
+          /usr/bin/telemt-cleanup.sh || true
+          rm -rf /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null || true
+
+          (
+            sleep 10
+            if command -v opkg >/dev/null 2>&1; then
+              opkg remove telemt-terminator 2>/dev/null || true
+            elif command -v apk >/dev/null 2>&1; then
+              apk del telemt-terminator 2>/dev/null || true
+            fi
+          ) &
+
           exit 0
           POSTINST
           chmod 0755 packaging/postinst
 
-          # ---- prerm: nothing to do ----
           cat > packaging/prerm <<'PRERM'
           #!/bin/sh
           exit 0
           PRERM
           chmod 0755 packaging/prerm
 
-          # ---- nfpm.yaml ----
-          cat > nfpm.yaml <<EOF
+          cat > nfpm_ipk.yaml <<EOF
           name: ${PKG_NAME}
-          arch: aarch64_generic
+          arch: all
           platform: linux
           version: ${PKG_VERSION}
           section: admin
           priority: optional
           maintainer: Arikusey
-          description: "One-shot Telemt cleanup for OpenWrt. Removes services, packages, configs, zombie processes, LuCI artifacts. Self-removes after execution."
+          description: "One-shot Telemt cleanup for OpenWrt 21-24. Removes services, packages, configs, zombie processes, LuCI artifacts, then self-removes."
           license: MIT
 
           depends:
@@ -179,26 +158,20 @@ jobs:
               file_info:
                 mode: 0755
 
-            - src: ./tun2proxy-bin
-              dst: /usr/bin/tun2proxy
-              file_info:
-                mode: 0755
-
           scripts:
             postinstall: ./packaging/postinst
             preremove: ./packaging/prerm
           EOF
 
-          # ---- nfpm.yaml for apk ----
           cat > nfpm_apk.yaml <<EOF
           name: ${PKG_NAME}
-          arch: aarch64_generic
+          arch: all
           platform: linux
           version: ${PKG_VERSION}
           section: admin
           priority: optional
           maintainer: Arikusey
-          description: "One-shot Telemt cleanup for OpenWrt."
+          description: "One-shot Telemt cleanup for OpenWrt 25+. Removes services, packages, configs, zombie processes, LuCI artifacts, then self-removes."
           license: MIT
 
           depends:
@@ -211,18 +184,13 @@ jobs:
               file_info:
                 mode: 0755
 
-            - src: ./tun2proxy-bin
-              dst: /usr/bin/tun2proxy
-              file_info:
-                mode: 0755
-
           scripts:
             postinstall: ./packaging/postinst
             preremove: ./packaging/prerm
           EOF
 
-          nfpm package --config nfpm.yaml     --packager ipk --target "${PKG_NAME}_${PKG_VERSION}_aarch64_generic.ipk"
-          nfpm package --config nfpm_apk.yaml --packager apk --target "${PKG_NAME}_${PKG_VERSION}_aarch64_generic.apk"
+          nfpm package --config nfpm_ipk.yaml --packager ipk --target "${PKG_NAME}_${PKG_VERSION}_all.ipk"
+          nfpm package --config nfpm_apk.yaml --packager apk --target "${PKG_NAME}_${PKG_VERSION}_all.apk"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4

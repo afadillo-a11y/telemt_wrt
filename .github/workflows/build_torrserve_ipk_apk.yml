@@ -1,0 +1,459 @@
+name: Build and Release TorrServer for OpenWrt
+
+on:
+  push:
+    tags:
+      - 'MatriX*'
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream ref to build: latest, tag, branch or commit SHA'
+        required: true
+        default: 'latest'
+      use_upx:
+        description: 'Also build UPX-compressed variant'
+        required: true
+        default: 'true'
+      architecture:
+        description: 'OpenWrt package arch'
+        required: true
+        default: 'aarch64_cortex-a53'
+
+jobs:
+  release:
+    name: Build and Release TorrServer
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    env:
+      PKG_NAME: torrserver
+      BIN_NAME: TorrServer
+      SERVICE_NAME: torrserver
+      OUT_BIN: TorrServer-linux-arm64-openwrt
+      OUT_BIN_UPX: TorrServer-linux-arm64-openwrt-upx
+      UPSTREAM_REPO: YouROK/TorrServer
+      DEFAULT_ARCH: aarch64_cortex-a53
+
+    steps:
+      - name: Checkout local repository
+        uses: actions/checkout@v4
+
+      - name: Resolve build metadata
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          REPO_URL="https://github.com/${UPSTREAM_REPO}.git"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            REQUESTED_REF="${{ github.event.inputs.version }}"
+            PKG_ARCH="${{ github.event.inputs.architecture }}"
+            USE_UPX_INPUT="${{ github.event.inputs.use_upx }}"
+          else
+            REQUESTED_REF="${GITHUB_REF_NAME}"
+            PKG_ARCH="${DEFAULT_ARCH}"
+            USE_UPX_INPUT="true"
+          fi
+
+          if [[ -z "${REQUESTED_REF}" || "${REQUESTED_REF}" == "latest" ]]; then
+            REQUESTED_REF="$(git ls-remote --refs --tags "${REPO_URL}" \
+              | awk -F/ '{print $3}' \
+              | grep -E '^(MatriX|v)[0-9]' \
+              | sort -V \
+              | tail -n 1)"
+          fi
+
+          if [[ -z "${REQUESTED_REF}" ]]; then
+            echo "Unable to determine upstream ref"
+            exit 1
+          fi
+
+          VERSION="${REQUESTED_REF}"
+          SAFE_VERSION="${VERSION#v}"
+
+          if [[ "${REQUESTED_REF}" =~ ^(MatriX[0-9]+([.][0-9]+)*)$ || "${REQUESTED_REF}" =~ ^v?[0-9]+([.][0-9]+)*([.-].*)?$ ]]; then
+            RELEASE_TAG="${REQUESTED_REF}"
+            RELEASE_NAME="TorrServer ${REQUESTED_REF} OpenWrt"
+          else
+            SAFE_VERSION="0.0.0-dev.${GITHUB_RUN_NUMBER}"
+            RELEASE_TAG="torrserver-${SAFE_VERSION}-${GITHUB_RUN_NUMBER}"
+            RELEASE_NAME="TorrServer ${SAFE_VERSION} OpenWrt"
+          fi
+
+          {
+            echo "REQUESTED_REF=${REQUESTED_REF}"
+            echo "VERSION=${VERSION}"
+            echo "SAFE_VERSION=${SAFE_VERSION}"
+            echo "RELEASE_TAG=${RELEASE_TAG}"
+            echo "RELEASE_NAME=${RELEASE_NAME}"
+            echo "PKG_ARCH=${PKG_ARCH}"
+            echo "USE_UPX_INPUT=${USE_UPX_INPUT}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Clone upstream repository
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          REPO_URL="https://github.com/${UPSTREAM_REPO}.git"
+          REF="${REQUESTED_REF}"
+
+          rm -rf upstream_src
+          git clone --depth 1 "${REPO_URL}" upstream_src
+          cd upstream_src
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${REF}" >/dev/null 2>&1; then
+            git fetch --depth 1 origin "refs/tags/${REF}:refs/tags/${REF}"
+            git checkout -q "tags/${REF}"
+          elif git ls-remote --exit-code --heads origin "${REF}" >/dev/null 2>&1; then
+            git fetch --depth 1 origin "${REF}"
+            git checkout -q FETCH_HEAD
+          else
+            git fetch --depth 1 origin "${REF}" || true
+            git checkout -q "${REF}"
+          fi
+
+          echo "UPSTREAM_COMMIT=$(git rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Setup Go from upstream go.mod
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream_src/server/go.mod
+          cache-dependency-path: |
+            upstream_src/server/go.sum
+            upstream_src/go.sum
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install system dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y jq dos2unix file binutils upx-ucl curl tar xz-utils
+
+          NFPM_VER="2.43.1"
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VER}/nfpm_${NFPM_VER}_Linux_x86_64.tar.gz" | tar -xz
+          sudo install -m 0755 nfpm /usr/local/bin/nfpm
+
+          go install github.com/swaggo/swag/cmd/swag@latest
+
+      - name: Build web assets
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd upstream_src
+          export NODE_OPTIONS=--openssl-legacy-provider
+          go run gen_web.go
+
+      - name: Generate swagger docs
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd upstream_src/server
+          "$(go env GOPATH)/bin/swag" init -g web/server.go
+
+      - name: Build minimal arm64 binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd upstream_src/server
+
+          export CGO_ENABLED=0
+          export GOOS=linux
+          export GOARCH=arm64
+
+          go mod tidy
+
+          go build \
+            -trimpath \
+            -buildvcs=false \
+            -tags 'nosqlite' \
+            -ldflags='-s -w -checklinkname=0 -buildid=' \
+            -o "../../${OUT_BIN}" \
+            ./cmd
+
+          cd ../..
+
+          strip --strip-unneeded "${OUT_BIN}" || true
+
+          cp -f "${OUT_BIN}" "${OUT_BIN_UPX}"
+          if [[ "${USE_UPX_INPUT}" == "true" ]]; then
+            upx --best --lzma "${OUT_BIN_UPX}" || true
+          fi
+
+          echo "=== STANDARD ==="
+          file "${OUT_BIN}"
+          ls -lh "${OUT_BIN}"
+
+          echo "=== UPX ==="
+          file "${OUT_BIN_UPX}"
+          ls -lh "${OUT_BIN_UPX}"
+
+      - name: Generate package files
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          PKGROOT="${GITHUB_WORKSPACE}/pkgroot"
+
+          mkdir -p \
+            "${PKGROOT}/etc/config" \
+            "${PKGROOT}/etc/init.d" \
+            "${PKGROOT}/usr/bin"
+
+          cat > "${PKGROOT}/etc/config/torrserver" <<'EOF'
+          config torrserver 'main'
+              option enabled '1'
+              option port '8090'
+              option ip ''
+              option path '/opt/torrserver'
+              option logpath ''
+              option weblogpath ''
+              option rdb '0'
+              option httpauth '0'
+              option dontkill '0'
+              option torrentsdir ''
+              option torrentaddr ''
+              option pubipv4 ''
+              option pubipv6 ''
+              option searchwa '0'
+              option maxsize ''
+              option tg ''
+              option fuse ''
+              option webdav '0'
+              option proxyurl ''
+              option proxymode 'tracker'
+          EOF
+
+          cat > "${PKGROOT}/etc/init.d/torrserver" <<'EOF'
+          #!/bin/sh /etc/rc.common
+
+          START=95
+          STOP=10
+          USE_PROCD=1
+
+          PROG="/usr/bin/TorrServer"
+          CFG="torrserver"
+
+          . /lib/functions.sh
+
+          append_arg() {
+              local value="$1"
+              local flag="$2"
+              [ -n "$value" ] && procd_append_param command "$flag" "$value"
+          }
+
+          append_bool_flag() {
+              local enabled="$1"
+              local flag="$2"
+              [ "$enabled" = "1" ] && procd_append_param command "$flag"
+          }
+
+          service_triggers() {
+              procd_add_reload_trigger "$CFG"
+          }
+
+          start_service() {
+              local enabled port ip path logpath weblogpath
+              local rdb httpauth dontkill torrentsdir torrentaddr
+              local pubipv4 pubipv6 searchwa maxsize tg fuse
+              local webdav proxyurl proxymode
+
+              config_load "$CFG"
+              config_get_bool enabled main enabled 1
+              [ "$enabled" -eq 1 ] || return 0
+
+              config_get port main port '8090'
+              config_get ip main ip ''
+              config_get path main path '/opt/torrserver'
+              config_get logpath main logpath ''
+              config_get weblogpath main weblogpath ''
+              config_get_bool rdb main rdb 0
+              config_get_bool httpauth main httpauth 0
+              config_get_bool dontkill main dontkill 0
+              config_get torrentsdir main torrentsdir ''
+              config_get torrentaddr main torrentaddr ''
+              config_get pubipv4 main pubipv4 ''
+              config_get pubipv6 main pubipv6 ''
+              config_get_bool searchwa main searchwa 0
+              config_get maxsize main maxsize ''
+              config_get tg main tg ''
+              config_get fuse main fuse ''
+              config_get_bool webdav main webdav 0
+              config_get proxyurl main proxyurl ''
+              config_get proxymode main proxymode 'tracker'
+
+              mkdir -p "$path"
+
+              procd_open_instance
+              procd_set_param command "$PROG"
+
+              append_arg "$port" --port
+              append_arg "$ip" --ip
+              append_arg "$path" --path
+              append_arg "$logpath" --logpath
+              append_arg "$weblogpath" --weblogpath
+              append_arg "$torrentsdir" --torrentsdir
+              append_arg "$torrentaddr" --torrentaddr
+              append_arg "$pubipv4" --pubipv4
+              append_arg "$pubipv6" --pubipv6
+              append_arg "$maxsize" --maxsize
+              append_arg "$tg" --tg
+              append_arg "$fuse" --fuse
+              append_arg "$proxyurl" --proxyurl
+              append_arg "$proxymode" --proxymode
+
+              append_bool_flag "$rdb" --rdb
+              append_bool_flag "$httpauth" --httpauth
+              append_bool_flag "$dontkill" --dontkill
+              append_bool_flag "$searchwa" --searchwa
+              append_bool_flag "$webdav" --webdav
+
+              procd_set_param respawn 3600 5 5
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
+
+          stop_service() {
+              return 0
+          }
+          EOF
+
+          chmod 0755 "${PKGROOT}/etc/init.d/torrserver"
+          dos2unix \
+            "${PKGROOT}/etc/config/torrserver" \
+            "${PKGROOT}/etc/init.d/torrserver"
+
+      - name: Create nFPM configs and packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p packaging
+
+          cat > packaging/postinstall.sh <<'EOF'
+          #!/bin/sh
+          set -e
+
+          [ -n "${IPKG_INSTROOT}" ] && exit 0
+
+          /etc/init.d/torrserver enable >/dev/null 2>&1 || true
+          /etc/init.d/torrserver restart >/dev/null 2>&1 || /etc/init.d/torrserver start >/dev/null 2>&1 || true
+          exit 0
+          EOF
+
+          cat > packaging/preremove.sh <<'EOF'
+          #!/bin/sh
+          set -e
+
+          [ -n "${IPKG_INSTROOT}" ] && exit 0
+
+          /etc/init.d/torrserver stop >/dev/null 2>&1 || true
+          /etc/init.d/torrserver disable >/dev/null 2>&1 || true
+          exit 0
+          EOF
+
+          chmod 0755 packaging/postinstall.sh packaging/preremove.sh
+
+          export SOURCE_DATE_EPOCH=1704067200
+
+          make_nfpm() {
+            local pkg_name="$1"
+            local bin_path="$2"
+            local target="$3"
+
+            cat > nfpm_ipk.yaml <<EOF
+          name: ${pkg_name}
+          arch: ${PKG_ARCH}
+          platform: linux
+          version: ${SAFE_VERSION}
+          section: net
+          priority: optional
+          maintainer: ${GITHUB_REPOSITORY_OWNER}
+          description: "TorrServer for OpenWrt ARM64"
+          homepage: https://github.com/${UPSTREAM_REPO}
+          license: GPL-3.0
+
+          depends:
+            - procd
+            - uci
+
+          contents:
+            - src: ./${bin_path}
+              dst: /usr/bin/${BIN_NAME}
+              file_info:
+                mode: 0755
+                mtime: 2024-01-01T00:00:00Z
+
+            - src: ./pkgroot/etc/init.d/torrserver
+              dst: /etc/init.d/torrserver
+              file_info:
+                mode: 0755
+                mtime: 2024-01-01T00:00:00Z
+
+            - src: ./pkgroot/etc/config/torrserver
+              dst: /etc/config/torrserver
+              type: config|noreplace
+              file_info:
+                mode: 0644
+                mtime: 2024-01-01T00:00:00Z
+
+          scripts:
+            postinstall: ./packaging/postinstall.sh
+            preremove: ./packaging/preremove.sh
+          EOF
+
+            nfpm package --config nfpm_ipk.yaml --packager ipk --target "${target}"
+          }
+
+          make_nfpm "${PKG_NAME}" "${OUT_BIN}" "${PKG_NAME}_${SAFE_VERSION}_${PKG_ARCH}.ipk"
+
+          if [[ "${USE_UPX_INPUT}" == "true" ]]; then
+            make_nfpm "${PKG_NAME}-upx" "${OUT_BIN_UPX}" "${PKG_NAME}-upx_${SAFE_VERSION}_${PKG_ARCH}.ipk"
+          fi
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sha256sum "${OUT_BIN}" *.ipk > SHA256SUMS.txt
+          if [[ "${USE_UPX_INPUT}" == "true" ]]; then
+            sha256sum "${OUT_BIN_UPX}" >> SHA256SUMS.txt
+          fi
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: torrserver-openwrt-${{ env.SAFE_VERSION }}
+          path: |
+            *.ipk
+            ${{
+              env.OUT_BIN
+            }}
+            ${{
+              env.OUT_BIN_UPX
+            }}
+            SHA256SUMS.txt
+
+      - name: GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_NAME }}
+          files: |
+            *.ipk
+            TorrServer-linux-arm64-openwrt
+            TorrServer-linux-arm64-openwrt-upx
+            SHA256SUMS.txt
+          draft: false
+          prerelease: false

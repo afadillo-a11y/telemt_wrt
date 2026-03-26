@@ -1,4 +1,4 @@
-name: Build and Release TorrServer for OpenWrt v3
+name: Build and Release TorrServer for OpenWrt v4.2
 
 on:
   push:
@@ -15,10 +15,6 @@ on:
         description: 'Also build UPX-compressed variant'
         required: true
         default: 'true'
-      architecture:
-        description: 'OpenWrt package arch'
-        required: true
-        default: 'aarch64_cortex-a53'
 
 jobs:
   release:
@@ -33,7 +29,6 @@ jobs:
       OUT_BIN: torrserver-linux-arm64-openwrt
       OUT_BIN_UPX: torrserver-linux-arm64-openwrt-upx
       UPSTREAM_REPO: YouROK/TorrServer
-      DEFAULT_ARCH: aarch64_cortex-a53
 
     steps:
       - name: Checkout local repository
@@ -48,11 +43,9 @@ jobs:
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             REQUESTED_REF="${{ github.event.inputs.version }}"
-            PKG_ARCH="${{ github.event.inputs.architecture }}"
             USE_UPX_INPUT="${{ github.event.inputs.use_upx }}"
           else
             REQUESTED_REF="${GITHUB_REF_NAME}"
-            PKG_ARCH="${DEFAULT_ARCH}"
             USE_UPX_INPUT="true"
           fi
 
@@ -99,7 +92,6 @@ jobs:
             echo "PKG_VERSION=${PKG_VERSION}"
             echo "RELEASE_TAG=${RELEASE_TAG}"
             echo "RELEASE_NAME=${RELEASE_NAME}"
-            echo "PKG_ARCH=${PKG_ARCH}"
             echo "USE_UPX_INPUT=${USE_UPX_INPUT}"
           } >> "${GITHUB_ENV}"
 
@@ -109,7 +101,6 @@ jobs:
           echo "  PKG_VERSION=${PKG_VERSION}"
           echo "  RELEASE_TAG=${RELEASE_TAG}"
           echo "  RELEASE_NAME=${RELEASE_NAME}"
-          echo "  PKG_ARCH=${PKG_ARCH}"
           echo "  USE_UPX_INPUT=${USE_UPX_INPUT}"
 
       - name: Clone upstream repository
@@ -359,40 +350,73 @@ jobs:
             "${PKGROOT}/etc/init.d/torrserver" \
             "${PKGROOT}/conffiles"
 
-      - name: Create nFPM configs and packages
+      - name: Create package scripts
         shell: bash
         run: |
           set -euxo pipefail
 
           mkdir -p packaging
 
-          cat > packaging/postinstall.sh <<'EOF'
+          cat > packaging/postinstall.sh <<EOF
           #!/bin/sh
-          set -e
+          echo ""
+          echo "============================================================"
+          echo " Installed TorrServer package version ${PKG_VERSION}"
+          echo " Upstream ref: ${REQUESTED_REF}"
+          echo " Binary path: /usr/bin/torrserver"
+          echo " Config path: /etc/config/torrserver"
+          echo " Data path default: /opt/torrserver"
+          echo "============================================================"
 
-          [ -n "${IPKG_INSTROOT}" ] && exit 0
+          [ -n "\${IPKG_INSTROOT}" ] && exit 0
 
+          echo "[postinstall] enabling service..."
           /etc/init.d/torrserver enable >/dev/null 2>&1 || true
+
+          echo "[postinstall] restarting service..."
           /etc/init.d/torrserver restart >/dev/null 2>&1 || /etc/init.d/torrserver start >/dev/null 2>&1 || true
 
+          echo "[postinstall] current service status:"
+          /etc/init.d/torrserver status 2>/dev/null || true
+
+          echo "[postinstall] if LuCI is not involved, open TorrServer web UI manually on port 8090."
+          echo "[postinstall] done."
           exit 0
           EOF
 
           cat > packaging/preremove.sh <<'EOF'
           #!/bin/sh
-          set -e
+          echo ""
+          echo "============================================================"
+          echo " Removing TorrServer package"
+          echo " Service: torrserver"
+          echo " Binary : /usr/bin/torrserver"
+          echo " Config : /etc/config/torrserver will be preserved by package policy"
+          echo " Data   : runtime/data files are not forcibly deleted"
+          echo "============================================================"
 
           [ -n "${IPKG_INSTROOT}" ] && exit 0
 
+          echo "[preremove] stopping service..."
           /etc/init.d/torrserver stop >/dev/null 2>&1 || true
+
+          echo "[preremove] disabling service..."
           /etc/init.d/torrserver disable >/dev/null 2>&1 || true
 
+          echo "[preremove] done."
           exit 0
           EOF
 
           cat > packaging/postremove.sh <<'EOF'
           #!/bin/sh
-          set -e
+          echo ""
+          echo "============================================================"
+          echo " TorrServer package removed"
+          echo " Preserved:"
+          echo "   - /etc/config/torrserver"
+          echo "   - user data under /opt/torrserver (if any)"
+          echo " Not removed automatically to avoid data loss."
+          echo "============================================================"
           exit 0
           EOF
 
@@ -401,22 +425,31 @@ jobs:
             packaging/preremove.sh \
             packaging/postremove.sh
 
+      - name: Build IPK and APK packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ARCHS=("aarch64_generic" "aarch64_cortex-a53")
+          FORMATS=("ipk" "apk")
+          export PKG_DESC="TorrServer for OpenWrt ARM64"
           export SOURCE_DATE_EPOCH=1704067200
 
-          make_nfpm() {
+          make_nfpm_yaml() {
             local pkg_name="$1"
             local bin_path="$2"
-            local target="$3"
+            local arch="$3"
+            local yaml_path="$4"
 
-            cat > nfpm_ipk.yaml <<EOF
+            cat > "${yaml_path}" <<EOF
           name: ${pkg_name}
-          arch: ${PKG_ARCH}
+          arch: ${arch}
           platform: linux
           version: ${PKG_VERSION}
           section: net
           priority: optional
           maintainer: ${GITHUB_REPOSITORY_OWNER}
-          description: "TorrServer for OpenWrt ARM64"
+          description: "${PKG_DESC}"
           homepage: https://github.com/${UPSTREAM_REPO}
           license: GPL-3.0
 
@@ -455,15 +488,48 @@ jobs:
             preremove: ./packaging/preremove.sh
             postremove: ./packaging/postremove.sh
           EOF
-
-            nfpm package --config nfpm_ipk.yaml --packager ipk --target "${target}"
           }
 
-          make_nfpm "${PKG_NAME}" "${OUT_BIN}" "${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.ipk"
+          build_flavor() {
+            local flavor="$1"
+            local pkg_name="$2"
+            local bin_path="$3"
+
+            for arch in "${ARCHS[@]}"; do
+              for fmt in "${FORMATS[@]}"; do
+                yaml="nfpm_${flavor}_${arch}_${fmt}.yaml"
+                target="${pkg_name}_${PKG_VERSION}_${arch}.${fmt}"
+                echo "Building ${target}"
+                make_nfpm_yaml "${pkg_name}" "${bin_path}" "${arch}" "${yaml}"
+                nfpm package --config "${yaml}" --packager "${fmt}" --target "${target}"
+                test -f "${target}"
+              done
+            done
+          }
+
+          build_flavor "standard" "${PKG_NAME}" "${OUT_BIN}"
 
           if [[ "${USE_UPX_INPUT}" == "true" ]]; then
-            make_nfpm "${PKG_NAME}-upx" "${OUT_BIN_UPX}" "${PKG_NAME}-upx_${PKG_VERSION}_${PKG_ARCH}.ipk"
+            build_flavor "upx" "${PKG_NAME}-upx" "${OUT_BIN_UPX}"
           fi
+
+      - name: Show built package list
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Working directory:"
+          pwd
+          echo
+          echo "Binary files:"
+          ls -la "${OUT_BIN}" || true
+          ls -la "${OUT_BIN_UPX}" || true
+          echo
+          echo "IPK files:"
+          ls -la *.ipk
+          echo
+          echo "APK files:"
+          ls -la *.apk
 
       - name: Generate checksums
         shell: bash
@@ -473,6 +539,7 @@ jobs:
           rm -f SHA256SUMS.txt
           sha256sum "${OUT_BIN}" >> SHA256SUMS.txt
           sha256sum *.ipk >> SHA256SUMS.txt
+          sha256sum *.apk >> SHA256SUMS.txt
 
           if [[ "${USE_UPX_INPUT}" == "true" ]]; then
             sha256sum "${OUT_BIN_UPX}" >> SHA256SUMS.txt
@@ -486,6 +553,7 @@ jobs:
           name: torrserver-openwrt-${{ env.PKG_VERSION }}
           path: |
             *.ipk
+            *.apk
             ${{ env.OUT_BIN }}
             ${{ env.OUT_BIN_UPX }}
             SHA256SUMS.txt
@@ -497,6 +565,7 @@ jobs:
           name: ${{ env.RELEASE_NAME }}
           files: |
             *.ipk
+            *.apk
             torrserver-linux-arm64-openwrt
             torrserver-linux-arm64-openwrt-upx
             SHA256SUMS.txt

@@ -665,6 +665,7 @@ jobs:
           return m
           EOF
 
+          # Принудительно чистим переводы строк в сгенерированных Lua-файлах
           dos2unix \
             root/usr/lib/lua/luci/controller/torrserver.lua \
             root/usr/lib/lua/luci/model/cbi/torrserver.lua
@@ -733,6 +734,12 @@ jobs:
           exit 0
           EOF
 
+          # Принудительно чистим шелл-скрипты пакета перед выдачей прав
+          dos2unix \
+            packaging/postinstall.sh \
+            packaging/preremove.sh \
+            packaging/postremove.sh
+
           chmod 0755 \
             packaging/postinstall.sh \
             packaging/preremove.sh \
@@ -786,10 +793,13 @@ jobs:
           }
 
           make_nfpm_yaml "nfpm_ipk.yaml"
+          # Чистим конфигурацию nfpm от CRLF на всякий случай
+          dos2unix nfpm_ipk.yaml
           nfpm package --config nfpm_ipk.yaml --packager ipk --target "${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.ipk"
           test -f "${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.ipk"
 
           make_nfpm_yaml "nfpm_apk.yaml"
+          dos2unix nfpm_apk.yaml
           nfpm package --config nfpm_apk.yaml --packager apk --target "${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.apk"
           test -f "${PKG_NAME}_${PKG_VERSION}_${PKG_ARCH}.apk"
 

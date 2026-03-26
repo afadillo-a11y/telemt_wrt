@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Package version, e.g. 1.2.1'
+        description: 'Package version, e.g. 1.2.3'
         required: true
-        default: '1.2.1'
+        default: '1.2.3'
 
 jobs:
   release:
@@ -58,7 +58,6 @@ jobs:
           mkdir -p \
             root/usr/lib/lua/luci/controller \
             root/usr/lib/lua/luci/model/cbi \
-            root/etc/config \
             packaging
 
           cat > root/usr/lib/lua/luci/controller/torrserver.lua <<'EOF'
@@ -85,11 +84,9 @@ jobs:
 
           function action_start()
               local sys = require "luci.sys"
-
               if not have_exec("/etc/init.d/torrserver") then
                   return json_out({ ok = false, error = "init script not found: /etc/init.d/torrserver" })
               end
-
               sys.call("/etc/init.d/torrserver start >/dev/null 2>&1")
               nixio.nanosleep(1)
               json_out({ ok = true })
@@ -97,11 +94,9 @@ jobs:
 
           function action_stop()
               local sys = require "luci.sys"
-
               if not have_exec("/etc/init.d/torrserver") then
                   return json_out({ ok = false, error = "init script not found: /etc/init.d/torrserver" })
               end
-
               sys.call("/etc/init.d/torrserver stop >/dev/null 2>&1")
               nixio.nanosleep(1)
               json_out({ ok = true })
@@ -109,11 +104,9 @@ jobs:
 
           function action_restart()
               local sys = require "luci.sys"
-
               if not have_exec("/etc/init.d/torrserver") then
                   return json_out({ ok = false, error = "init script not found: /etc/init.d/torrserver" })
               end
-
               sys.call("/etc/init.d/torrserver restart >/dev/null 2>&1")
               nixio.nanosleep(2)
               json_out({ ok = true })
@@ -124,7 +117,6 @@ jobs:
               local http = require "luci.http"
 
               local log = sys.exec("logread -e 'torrserver' | tail -n 200")
-
               if not log or #log == 0 then
                   log = "Лог пуст. Возможно, сервис не запущен или сообщения были вытеснены другими системными событиями."
               end
@@ -251,17 +243,13 @@ jobs:
 
           local function safe_num_port(v)
               local p = tonumber(v)
-              if not p or p < 1 or p > 65535 then
-                  return "8090"
-              end
+              if not p or p < 1 or p > 65535 then return "8090" end
               return tostring(math.floor(p))
           end
 
           local function safe_host(v)
               v = tostring(v or "")
-              if v:match("^[%w%._:%-%[%]]+$") then
-                  return v
-              end
+              if v:match("^[%w%._:%-%[%]]+$") then return v end
               return "192.168.1.1"
           end
 
@@ -296,14 +284,7 @@ jobs:
           local warning_html = ""
           if not bin_present or not init_present then
               warning_html = [[
-              <div style="
-                  margin: 0 0 16px 0;
-                  padding: 12px 14px;
-                  border-radius: 8px;
-                  border: 1px solid rgba(255,180,0,.45);
-                  background: rgba(255,180,0,.10);
-                  color: var(--text-color-high, #f5f5f5);
-              ">
+              <div style="margin:0 0 16px 0;padding:12px 14px;border-radius:8px;border:1px solid rgba(255,180,0,.45);background:rgba(255,180,0,.10);color:var(--text-color-high,#f5f5f5);">
                   <strong>Нужен установленный TorrServer daemon.</strong><br/>
                   Ожидаются:<br/>
                   <code>/usr/bin/torrserver</code><br/>
@@ -325,14 +306,7 @@ jobs:
 
           local html_view = [[
           <style>
-              .ts-wrap {
-                  display: flex;
-                  flex-wrap: wrap;
-                  gap: 15px;
-                  margin-bottom: 20px;
-                  align-items: stretch;
-              }
-
+              .ts-wrap { display:flex; flex-wrap:wrap; gap:15px; margin-bottom:20px; align-items:stretch; }
               .ts-card {
                   background: var(--background-color-medium, rgba(255,255,255,.04));
                   border: 1px solid var(--border-color-medium, rgba(255,255,255,.10));
@@ -346,146 +320,26 @@ jobs:
                   justify-content: space-between;
                   color: var(--text-color-high, #f5f5f5);
               }
-
-              .ts-card.wide { width: 250px; }
-
-              .ts-head {
-                  font-size: 10px;
-                  color: var(--text-color-medium, #aaa);
-                  text-transform: uppercase;
-                  margin-bottom: 8px;
-                  font-weight: 600;
-              }
-
-              .ts-val-big {
-                  font-size: 22px;
-                  font-weight: bold;
-                  color: var(--text-color-high, #f5f5f5);
-                  line-height: 1.2;
-              }
-
-              .ts-unit {
-                  font-size: 12px;
-                  color: var(--text-color-medium, #aaa);
-                  font-weight: normal;
-              }
-
-              .ts-sub {
-                  font-size: 11px;
-                  color: var(--text-color-medium, #aaa);
-                  margin-top: 4px;
-              }
-
-              .mem-bar-bg {
-                  background: rgba(255,255,255,.08);
-                  height: 6px;
-                  border-radius: 3px;
-                  overflow: hidden;
-                  margin: 8px 0 4px 0;
-              }
-
-              .mem-bar-fill {
-                  background: #2196F3;
-                  height: 100%;
-                  width: 0%;
-                  transition: width 0.5s ease-in-out;
-              }
-
-              .cores-grid {
-                  display: flex;
-                  gap: 6px;
-                  height: 80px;
-                  align-items: flex-end;
-                  justify-content: center;
-                  margin-top: 5px;
-              }
-
-              .core-col {
-                  width: 22px;
-                  display: flex;
-                  flex-direction: column;
-                  align-items: center;
-                  height: 100%;
-                  justify-content: flex-end;
-              }
-
-              .core-track {
-                  width: 100%;
-                  height: 65px;
-                  background: rgba(255,255,255,.06);
-                  position: relative;
-                  border-radius: 3px;
-                  overflow: hidden;
-                  border: 1px solid rgba(255,255,255,.08);
-                  display: flex;
-                  flex-direction: column-reverse;
-              }
-
-              .core-fill {
-                  width: 100%;
-                  background: #4caf50;
-                  height: 0%;
-                  transition: height 0.4s ease-out;
-                  min-height: 0px;
-              }
-
-              .core-num {
-                  font-size: 10px;
-                  color: var(--text-color-medium, #aaa);
-                  margin-top: 4px;
-                  font-weight: bold;
-              }
-
-              .ctrl-panel {
-                  margin-top: 15px;
-                  display: flex;
-                  justify-content: space-between;
-                  gap: 8px;
-                  width: 100%;
-              }
-
-              .btn-action {
-                  flex: 1;
-                  padding: 8px 0;
-                  border: none;
-                  border-radius: 4px;
-                  color: #fff;
-                  cursor: pointer;
-                  font-size: 11px;
-                  font-weight: bold;
-                  text-transform: uppercase;
-                  transition: opacity 0.2s, filter 0.2s;
-                  text-align: center;
-              }
-
-              .btn-action:hover { opacity: 0.9; }
-              .btn-start { background-color: #4caf50; }
-              .btn-stop { background-color: #f44336; }
-              .btn-restart { background-color: #ff9800; }
-
-              .btn-disabled {
-                  background-color: #666 !important;
-                  color: #ddd !important;
-                  cursor: wait !important;
-                  filter: grayscale(100%);
-              }
-
-              .log-box {
-                  width: 100%;
-                  margin-top: 5px;
-                  background: rgba(0,0,0,.35);
-                  color: #f8f8f2;
-                  border-radius: 8px;
-                  padding: 10px;
-                  font-family: monospace;
-                  font-size: 11px;
-                  height: 300px;
-                  overflow-y: auto;
-                  white-space: pre-wrap;
-                  display: none;
-                  border: 1px solid rgba(255,255,255,.08);
-                  text-align: left;
-              }
+              .ts-card.wide { width:250px; }
+              .ts-head { font-size:10px; color:var(--text-color-medium,#aaa); text-transform:uppercase; margin-bottom:8px; font-weight:600; }
+              .ts-val-big { font-size:22px; font-weight:bold; color:var(--text-color-high,#f5f5f5); line-height:1.2; }
+              .ts-unit { font-size:12px; color:var(--text-color-medium,#aaa); font-weight:normal; }
+              .ts-sub { font-size:11px; color:var(--text-color-medium,#aaa); margin-top:4px; }
+              .mem-bar-bg { background:rgba(255,255,255,.08); height:6px; border-radius:3px; overflow:hidden; margin:8px 0 4px 0; }
+              .mem-bar-fill { background:#2196F3; height:100%; width:0%; transition:width 0.5s ease-in-out; }
+              .cores-grid { display:flex; gap:6px; height:80px; align-items:flex-end; justify-content:center; margin-top:5px; }
+              .core-col { width:22px; display:flex; flex-direction:column; align-items:center; height:100%; justify-content:flex-end; }
+              .core-track { width:100%; height:65px; background:rgba(255,255,255,.06); position:relative; border-radius:3px; overflow:hidden; border:1px solid rgba(255,255,255,.08); display:flex; flex-direction:column-reverse; }
+              .core-fill { width:100%; background:#4caf50; height:0%; transition:height 0.4s ease-out; min-height:0px; }
+              .core-num { font-size:10px; color:var(--text-color-medium,#aaa); margin-top:4px; font-weight:bold; }
+              .ctrl-panel { margin-top:15px; display:flex; justify-content:space-between; gap:8px; width:100%; }
+              .btn-action { flex:1; padding:8px 0; border:none; border-radius:4px; color:#fff; cursor:pointer; font-size:11px; font-weight:bold; text-transform:uppercase; transition:opacity 0.2s, filter 0.2s; text-align:center; }
+              .btn-action:hover { opacity:0.9; }
+              .btn-start { background-color:#4caf50; }
+              .btn-stop { background-color:#f44336; }
+              .btn-restart { background-color:#ff9800; }
+              .btn-disabled { background-color:#666 !important; color:#ddd !important; cursor:wait !important; filter:grayscale(100%); }
+              .log-box { width:100%; margin-top:5px; background:rgba(0,0,0,.35); color:#f8f8f2; border-radius:8px; padding:10px; font-family:monospace; font-size:11px; height:300px; overflow-y:auto; white-space:pre-wrap; display:none; border:1px solid rgba(255,255,255,.08); text-align:left; }
           </style>
 
           <div class="ts-wrap">
@@ -516,7 +370,7 @@ jobs:
                       <div class="core-col"><div class="core-track"><div id="c2" class="core-fill" style="height:0%"></div></div><div class="core-num">2</div></div>
                       <div class="core-col"><div class="core-track"><div id="c3" class="core-fill" style="height:0%"></div></div><div class="core-num">3</div></div>
                   </div>
-                  <div id="cores_txt" class="ts-sub" style="margin-top:5px; font-size:9px;">0% | 0% | 0% | 0%</div>
+                  <div id="cores_txt" class="ts-sub" style="margin-top:5px;font-size:9px;">0% | 0% | 0% | 0%</div>
               </div>
           </div>
 
@@ -525,20 +379,13 @@ jobs:
               var u_start = ']] .. jsq(url_start) .. [[';
               var u_stop = ']] .. jsq(url_stop) .. [[';
               var u_restart = ']] .. jsq(url_restart) .. [[';
+              var u_log_api = ']] .. jsq(url_log) .. [[';
               var pendingAction = null;
               var fastPollUntil = 0;
 
-              function nowSec() {
-                  return Math.floor(Date.now() / 1000);
-              }
-
-              function setFastPoll(seconds) {
-                  fastPollUntil = nowSec() + seconds;
-              }
-
-              function nextPollDelay() {
-                  return (nowSec() < fastPollUntil) ? 1000 : 3000;
-              }
+              function nowSec() { return Math.floor(Date.now() / 1000); }
+              function setFastPoll(seconds) { fastPollUntil = nowSec() + seconds; }
+              function nextPollDelay() { return (nowSec() < fastPollUntil) ? 1000 : 3000; }
 
               function getColor(pct) {
                   if (pct > 80) return '#f44336';
@@ -557,14 +404,13 @@ jobs:
               }
 
               function setButtonsBusy(text) {
-                  var ids = ['btn_start', 'btn_stop', 'btn_restart'];
-                  for (var i = 0; i < ids.length; i++) {
-                      var b = document.getElementById(ids[i]);
+                  ['btn_start','btn_stop','btn_restart'].forEach(function(id) {
+                      var b = document.getElementById(id);
                       if (b) {
                           b.disabled = true;
                           b.classList.add('btn-disabled');
                       }
-                  }
+                  });
                   if (pendingAction) {
                       var active = document.getElementById('btn_' + pendingAction);
                       if (active) active.innerText = text;
@@ -572,14 +418,13 @@ jobs:
               }
 
               function clearButtonsBusy() {
-                  var ids = ['btn_start', 'btn_stop', 'btn_restart'];
-                  for (var i = 0; i < ids.length; i++) {
-                      var b = document.getElementById(ids[i]);
+                  ['btn_start','btn_stop','btn_restart'].forEach(function(id) {
+                      var b = document.getElementById(id);
                       if (b) {
                           b.disabled = false;
                           b.classList.remove('btn-disabled');
                       }
-                  }
+                  });
               }
 
               function renderButtons(running, controlsAllowed) {
@@ -591,9 +436,9 @@ jobs:
                       return;
                   }
 
-                  var htmlStart = '<button type="button" id="btn_start" class="btn-action btn-start" onclick="srv(\'start\')">Start</button>';
-                  var htmlRun = '<button type="button" id="btn_stop" class="btn-action btn-stop" onclick="srv(\'stop\')">Stop</button>' +
-                                '<button type="button" id="btn_restart" class="btn-action btn-restart" onclick="srv(\'restart\')">Restart</button>';
+                  var htmlStart = '<button type="button" id="btn_start" class="btn-action btn-start" onclick="srv(\\'start\\')">Start</button>';
+                  var htmlRun = '<button type="button" id="btn_stop" class="btn-action btn-stop" onclick="srv(\\'stop\\')">Stop</button>' +
+                                '<button type="button" id="btn_restart" class="btn-action btn-restart" onclick="srv(\\'restart\\')">Restart</button>';
 
                   p.innerHTML = running ? htmlRun : htmlStart;
 
@@ -620,7 +465,6 @@ jobs:
                           forceUpdate();
                           return;
                       }
-
                       setTimeout(forceUpdate, 500);
                       setTimeout(forceUpdate, 1200);
                       setTimeout(forceUpdate, 2500);
@@ -657,9 +501,7 @@ jobs:
                   if (data.running) {
                       if (st) st.innerHTML = '<span style="color:#4caf50">ЗАПУЩЕН</span>';
                       renderButtons(true, true);
-
-                      var memMb = (data.mem_kb / 1024).toFixed(1);
-                      document.getElementById('ts_mem').innerText = memMb;
+                      document.getElementById('ts_mem').innerText = (data.mem_kb / 1024).toFixed(1);
                       document.getElementById('ts_cpu').innerText = data.ts_cpu;
                   } else {
                       if (pendingAction === 'stop') {
@@ -669,7 +511,6 @@ jobs:
                       } else {
                           if (st) st.innerHTML = '<span style="color:#f44336">ОСТАНОВЛЕН</span>';
                       }
-
                       renderButtons(false, true);
                       document.getElementById('ts_mem').innerText = '0';
                       document.getElementById('ts_cpu').innerText = '0';
@@ -680,7 +521,6 @@ jobs:
                       var freeMb = (data.sys_mem.available / 1024).toFixed(0);
                       var totalMb = (data.sys_mem.total / 1024).toFixed(0);
                       document.getElementById('mem_details').innerText = 'Free: ' + freeMb + ' MB | Total: ' + totalMb + ' MB';
-
                       if (data.running) {
                           var pct = (data.mem_kb / data.sys_mem.total) * 100;
                           document.getElementById('mem_bar').style.width = Math.max(pct, 1) + '%';
@@ -700,7 +540,6 @@ jobs:
                   if (pendingAction === 'start' && data.running) pendingAction = null;
                   if (pendingAction === 'restart' && data.running) pendingAction = null;
                   if (pendingAction === 'stop' && !data.running) pendingAction = null;
-
                   if (!pendingAction) clearButtonsBusy();
               }
 
@@ -712,28 +551,23 @@ jobs:
                   } else {
                       el.style.display = 'block';
                       fetchLog();
-                      setTimeout(function() {
-                          try { el.scrollIntoView({behavior: 'smooth', block: 'start'}); } catch (err) {}
-                      }, 100);
                   }
               }
 
               function fetchLog() {
                   var el = document.getElementById('ts_log');
                   el.innerText = 'Загрузка лога...';
-                  XHR.get(']] .. jsq(url_log) .. [[', null, function(x, data) {
-                      if (x && x.responseText) {
-                          el.innerText = x.responseText;
-                      } else {
-                          el.innerText = 'Нет данных.';
-                      }
+                  XHR.get(u_log_api, null, function(x) {
+                      el.innerText = (x && x.responseText) ? x.responseText : 'Нет данных.';
                   });
               }
 
               forceUpdate();
               schedulePoll();
           </script>
-          ]]
+
+          <div id="ts_log" class="log-box">Загрузка...</div>
+          EOF
 
           st = s:option(DummyValue, "_monitor")
           st.rawhtml = true
@@ -751,6 +585,7 @@ jobs:
 
           e = conf:taboption("basic", Flag, "enabled", translate("Автозапуск"))
           e.rmempty = false
+          e.default = "1"
 
           e = conf:taboption("basic", Value, "port", translate("Порт веб-интерфейса"))
           e.datatype = "port"
@@ -830,34 +665,9 @@ jobs:
           return m
           EOF
 
-          cat > root/etc/config/torrserver <<'EOF'
-          config torrserver 'main'
-              option enabled '1'
-              option port '8090'
-              option path '/opt/torrserver'
-              option proxymode 'tracker'
-              option dontkill '1'
-              option httpauth '0'
-              option rdb '0'
-              option ip ''
-              option logpath ''
-              option weblogpath ''
-              option torrentsdir ''
-              option torrentaddr ''
-              option pubipv4 ''
-              option pubipv6 ''
-              option searchwa '0'
-              option maxsize ''
-              option tg ''
-              option fuse ''
-              option webdav '0'
-              option proxyurl ''
-          EOF
-
           dos2unix \
             root/usr/lib/lua/luci/controller/torrserver.lua \
-            root/usr/lib/lua/luci/model/cbi/torrserver.lua \
-            root/etc/config/torrserver
+            root/usr/lib/lua/luci/model/cbi/torrserver.lua
 
       - name: Create package scripts
         shell: bash
@@ -877,6 +687,7 @@ jobs:
           [ -n "\${IPKG_INSTROOT}" ] && exit 0
 
           rm -f /tmp/luci-indexcache /tmp/luci-modulecache 2>/dev/null || true
+          rm -f /tmp/opkg-lists/* 2>/dev/null || true
           /etc/init.d/rpcd reload >/dev/null 2>&1 || true
           /etc/init.d/uhttpd reload >/dev/null 2>&1 || true
 
@@ -963,13 +774,6 @@ jobs:
 
             - src: ./root/usr/lib/lua/luci/model/cbi/torrserver.lua
               dst: /usr/lib/lua/luci/model/cbi/torrserver.lua
-              file_info:
-                mode: 0644
-                mtime: 2024-01-01T00:00:00Z
-
-            - src: ./root/etc/config/torrserver
-              dst: /etc/config/torrserver
-              type: config|noreplace
               file_info:
                 mode: 0644
                 mtime: 2024-01-01T00:00:00Z

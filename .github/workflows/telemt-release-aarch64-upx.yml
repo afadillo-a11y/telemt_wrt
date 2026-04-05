@@ -1,4 +1,4 @@
-name: Build and Release Headless Telemt (aarch64-musl)
+name: Build and Release Headless Telemt (aarch64 build + x86_64 upstream)
 
 on:
   push:
@@ -8,16 +8,31 @@ on:
   workflow_dispatch:
     inputs:
       build_target:
-        description: 'Enter tag (e.g., 3.3.15) or branch (main)'
+        description: 'Enter tag (e.g. 3.3.35) or branch (main)'
         required: true
-        default: '3.3.15'
+        default: '3.3.35'
 
 jobs:
   release:
-    name: Build and Release
+    name: Build and Package
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
+    env:
+      UPSTREAM_REPO: telemt/telemt
+      PKG_NAME: telemt
+      PKG_DESC: Advanced MTProto telemt proxy with FakeTLS in a tiny, highly-optimized variant for OpenWrt. (Headless Core Daemon + Init Scripts)
+
+      AARCH64_TARGET: aarch64-unknown-linux-musl
+      AARCH64_OUT_BIN: telemt-aarch64-musl
+
+      X86_64_ASSET_NAME: telemt-x86_64-linux-musl.tar.gz
+      X86_64_ASSET_SHA256_NAME: telemt-x86_64-linux-musl.tar.gz.sha256
+      X86_64_OUT_BIN: telemt-x86_64-musl
+
+      PKG_ARCH_AARCH64S: aarch64_generic aarch64_cortex-a53
+      PKG_ARCH_X86_64: x86_64
 
     steps:
       - name: Extract version
@@ -27,12 +42,15 @@ jobs:
           set -euxo pipefail
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            echo "VERSION=${{ github.event.inputs.build_target }}" >> "$GITHUB_ENV"
+            VERSION="${{ github.event.inputs.build_target }}"
           elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_ENV"
+            VERSION="${GITHUB_REF#refs/tags/}"
           else
-            echo "VERSION=nightly" >> "$GITHUB_ENV"
+            VERSION="nightly"
           fi
+
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "TAG=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Checkout local repository
         uses: actions/checkout@v4
@@ -49,24 +67,26 @@ jobs:
         with:
           targets: aarch64-unknown-linux-musl
 
-      - name: Install build tools
+      - name: Install build and packaging tools
         shell: bash
         run: |
           set -euxo pipefail
 
           sudo apt-get update
-          sudo apt-get install -y jq curl tar xz-utils upx-ucl dos2unix
+          sudo apt-get install -y jq curl tar xz-utils dos2unix upx-ucl file
 
-          CROSS_TAG="$(curl -sL https://api.github.com/repos/cross-rs/cross/releases/latest | jq -r .tag_name)"
-          curl -sSfL "https://github.com/cross-rs/cross/releases/download/${CROSS_TAG}/cross-x86_64-unknown-linux-musl.tar.gz" | tar -xz
+          CROSS_TAG="$(curl -fsSL https://api.github.com/repos/cross-rs/cross/releases/latest | jq -r .tag_name)"
+          curl -fsSL "https://github.com/cross-rs/cross/releases/download/${CROSS_TAG}/cross-x86_64-unknown-linux-musl.tar.gz" | tar -xz
           sudo install -m 0755 cross /usr/local/bin/cross
 
-          NFPM_TAG="$(curl -sL https://api.github.com/repos/goreleaser/nfpm/releases/latest | jq -r .tag_name)"
+          NFPM_TAG="$(curl -fsSL https://api.github.com/repos/goreleaser/nfpm/releases/latest | jq -r .tag_name)"
           NFPM_VER="${NFPM_TAG#v}"
-          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/${NFPM_TAG}/nfpm_${NFPM_VER}_Linux_x86_64.tar.gz" | tar -xz
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/${NFPM_TAG}/nfpm_${NFPM_VER}_Linux_x86_64.tar.gz" | tar -xz
           sudo install -m 0755 nfpm /usr/local/bin/nfpm
 
-      - name: Build binary with cross
+          gh --version || true
+
+      - name: Build aarch64 binary with cross
         shell: bash
         run: |
           set -euxo pipefail
@@ -78,24 +98,67 @@ jobs:
           export CARGO_PROFILE_RELEASE_PANIC=abort
           export CARGO_PROFILE_RELEASE_STRIP=true
 
-          cross build --release --target aarch64-unknown-linux-musl
+          cross build --release --target "${AARCH64_TARGET}"
 
-      - name: Compress with UPX
+      - name: Compress aarch64 binary with UPX
         shell: bash
         run: |
           set -euxo pipefail
 
-          upx --best --lzma upstream_src/target/aarch64-unknown-linux-musl/release/telemt
+          upx --best --lzma "upstream_src/target/${AARCH64_TARGET}/release/telemt"
 
-      - name: Append version marker and move binary
+      - name: Prepare aarch64 binary
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Required for LuCI/UI logic that reads version via tail from the binary.
-          printf "\nMTProxy v%s\n" "${{ env.VERSION }}" >> upstream_src/target/aarch64-unknown-linux-musl/release/telemt
+          cp "upstream_src/target/${AARCH64_TARGET}/release/telemt" "${AARCH64_OUT_BIN}"
+          printf "\nMTProxy v%s\n" "${VERSION}" >> "${AARCH64_OUT_BIN}"
+          chmod 0755 "${AARCH64_OUT_BIN}"
+          file "${AARCH64_OUT_BIN}" || true
 
-          mv upstream_src/target/aarch64-unknown-linux-musl/release/telemt telemt-aarch64-musl
+      - name: Download upstream x86_64 release asset
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p upstream_release
+
+          gh release download "${TAG}" \
+            --repo "${UPSTREAM_REPO}" \
+            --pattern "${X86_64_ASSET_NAME}" \
+            --pattern "${X86_64_ASSET_SHA256_NAME}" \
+            --dir upstream_release
+
+          test -f "upstream_release/${X86_64_ASSET_NAME}"
+          test -f "upstream_release/${X86_64_ASSET_SHA256_NAME}"
+
+      - name: Verify upstream x86_64 archive checksum
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd upstream_release
+          sha256sum -c "${X86_64_ASSET_SHA256_NAME}"
+
+      - name: Extract x86_64 binary from upstream asset
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          mkdir -p extracted_x86_64
+          tar -xzf "upstream_release/${X86_64_ASSET_NAME}" -C extracted_x86_64
+
+          BIN_PATH="$(find extracted_x86_64 -type f -name telemt | head -n1)"
+          test -n "${BIN_PATH}"
+          test -f "${BIN_PATH}"
+
+          install -m 0755 "${BIN_PATH}" "${X86_64_OUT_BIN}"
+          printf "\nMTProxy v%s\n" "${VERSION}" >> "${X86_64_OUT_BIN}"
+          chmod 0755 "${X86_64_OUT_BIN}"
+          file "${X86_64_OUT_BIN}" || true
 
       - name: Fix CRLF line endings in scripts
         shell: bash
@@ -104,21 +167,18 @@ jobs:
 
           dos2unix files/telemt.init files/telemt.config
 
-      - name: Build IPK and APK packages with nFPM
+      - name: Generate maintainer scripts
         shell: bash
         run: |
           set -euxo pipefail
-
-          export PKG_VER="${{ env.VERSION }}"
-          ARCHS=("aarch64_generic" "aarch64_cortex-a53")
 
           cat > postinst.sh <<EOF
           #!/bin/sh
           echo ""
           echo "================================================================="
-          echo " Installed Headless Telemt version ${PKG_VER}"
-          echo " To manage via LuCI WebUI, install:"
-          echo " https://github.com/Medvedolog/luci-app-telemt"
+          echo " Installed Headless Telemt version ${VERSION}"
+          echo " Managed by procd via /etc/init.d/telemt"
+          echo " LuCI package (optional): luci-app-telemt"
           echo "================================================================="
 
           if pidof telemt >/dev/null 2>&1; then
@@ -136,7 +196,12 @@ jobs:
               uci commit telemt 2>/dev/null || true
           fi
 
+          chmod 0755 /usr/bin/telemt 2>/dev/null || true
+          chmod 0755 /etc/init.d/telemt 2>/dev/null || true
+          chmod 0644 /etc/config/telemt 2>/dev/null || true
+
           /etc/init.d/telemt enable 2>/dev/null || true
+          /etc/init.d/telemt restart 2>/dev/null || /etc/init.d/telemt start 2>/dev/null || true
           exit 0
           EOF
 
@@ -160,26 +225,32 @@ jobs:
           echo "================================================================="
           rm -f /var/etc/telemt.toml
           rm -f /var/etc/telemt.version
+          rm -f /tmp/etc/telemt.toml
           rm -f /tmp/telemt_stats.txt
           exit 0
           EOF
 
           chmod 0755 postinst.sh prerm.sh postrm.sh
 
-          export PKG_DESC="Advanced MTProto telemt proxy with FakeTLS in a tiny, highly-optimized variant for OpenWrt. (Headless Core Daemon + Init Scripts)"
+      - name: Build IPK packages
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           export SOURCE_DATE_EPOCH=1704067200
-          for ARCH in "${ARCHS[@]}"; do
-            export PKG_ARCH="${ARCH}"
-            cat > nfpm_ipk.yaml <<EOF
-          name: telemt
-          arch: ${PKG_ARCH}
+
+          for ARCH in ${PKG_ARCH_AARCH64S}; do
+            cat > nfpm_ipk_${ARCH}.yaml <<EOF
+          name: ${PKG_NAME}
+          arch: ${ARCH}
           platform: linux
-          version: ${PKG_VER}
+          version: ${VERSION}
+          section: net
+          priority: optional
           maintainer: Telemt Team
           description: "${PKG_DESC}"
           contents:
-            - src: ./telemt-aarch64-musl
+            - src: ./${AARCH64_OUT_BIN}
               dst: /usr/bin/telemt
               file_info:
                 mode: 0755
@@ -201,22 +272,68 @@ jobs:
             postremove: ./postrm.sh
           EOF
 
-            nfpm package --config nfpm_ipk.yaml --packager ipk --target "telemt_${PKG_VER}_${PKG_ARCH}.ipk"
-            test -f "telemt_${PKG_VER}_${PKG_ARCH}.ipk"
+            nfpm package \
+              --config nfpm_ipk_${ARCH}.yaml \
+              --packager ipk \
+              --target "${PKG_NAME}_${VERSION}_${ARCH}.ipk"
+
+            test -f "${PKG_NAME}_${VERSION}_${ARCH}.ipk"
           done
 
-          unset SOURCE_DATE_EPOCH
-          for ARCH in "${ARCHS[@]}"; do
-            export PKG_ARCH="${ARCH}"
-            cat > nfpm_apk.yaml <<EOF
-          name: telemt
-          arch: ${PKG_ARCH}
+          cat > nfpm_ipk_${PKG_ARCH_X86_64}.yaml <<EOF
+          name: ${PKG_NAME}
+          arch: ${PKG_ARCH_X86_64}
           platform: linux
-          version: ${PKG_VER}
+          version: ${VERSION}
+          section: net
+          priority: optional
           maintainer: Telemt Team
           description: "${PKG_DESC}"
           contents:
-            - src: ./telemt-aarch64-musl
+            - src: ./${X86_64_OUT_BIN}
+              dst: /usr/bin/telemt
+              file_info:
+                mode: 0755
+                mtime: 2024-01-01T00:00:00Z
+            - src: ./files/telemt.init
+              dst: /etc/init.d/telemt
+              file_info:
+                mode: 0755
+                mtime: 2024-01-01T00:00:00Z
+            - src: ./files/telemt.config
+              dst: /etc/config/telemt
+              type: config
+              file_info:
+                mode: 0644
+                mtime: 2024-01-01T00:00:00Z
+          scripts:
+            postinstall: ./postinst.sh
+            preremove: ./prerm.sh
+            postremove: ./postrm.sh
+          EOF
+
+          nfpm package \
+            --config nfpm_ipk_${PKG_ARCH_X86_64}.yaml \
+            --packager ipk \
+            --target "${PKG_NAME}_${VERSION}_${PKG_ARCH_X86_64}.ipk"
+
+          test -f "${PKG_NAME}_${VERSION}_${PKG_ARCH_X86_64}.ipk"
+
+      - name: Build APK packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          for ARCH in ${PKG_ARCH_AARCH64S}; do
+            cat > nfpm_apk_${ARCH}.yaml <<EOF
+          name: ${PKG_NAME}
+          arch: ${ARCH}
+          platform: linux
+          version: ${VERSION}
+          maintainer: Telemt Team
+          description: "${PKG_DESC}"
+          contents:
+            - src: ./${AARCH64_OUT_BIN}
               dst: /usr/bin/telemt
               file_info:
                 mode: 0755
@@ -235,9 +352,47 @@ jobs:
             postremove: ./postrm.sh
           EOF
 
-            nfpm package --config nfpm_apk.yaml --packager apk --target "telemt_${PKG_VER}_${PKG_ARCH}.apk"
-            test -f "telemt_${PKG_VER}_${PKG_ARCH}.apk"
+            nfpm package \
+              --config nfpm_apk_${ARCH}.yaml \
+              --packager apk \
+              --target "${PKG_NAME}_${VERSION}_${ARCH}.apk"
+
+            test -f "${PKG_NAME}_${VERSION}_${ARCH}.apk"
           done
+
+          cat > nfpm_apk_${PKG_ARCH_X86_64}.yaml <<EOF
+          name: ${PKG_NAME}
+          arch: ${PKG_ARCH_X86_64}
+          platform: linux
+          version: ${VERSION}
+          maintainer: Telemt Team
+          description: "${PKG_DESC}"
+          contents:
+            - src: ./${X86_64_OUT_BIN}
+              dst: /usr/bin/telemt
+              file_info:
+                mode: 0755
+            - src: ./files/telemt.init
+              dst: /etc/init.d/telemt
+              file_info:
+                mode: 0755
+            - src: ./files/telemt.config
+              dst: /etc/config/telemt
+              type: config
+              file_info:
+                mode: 0644
+          scripts:
+            postinstall: ./postinst.sh
+            preremove: ./prerm.sh
+            postremove: ./postrm.sh
+          EOF
+
+          nfpm package \
+            --config nfpm_apk_${PKG_ARCH_X86_64}.yaml \
+            --packager apk \
+            --target "${PKG_NAME}_${VERSION}_${PKG_ARCH_X86_64}.apk"
+
+          test -f "${PKG_NAME}_${VERSION}_${PKG_ARCH_X86_64}.apk"
 
       - name: Show built files
         shell: bash
@@ -252,7 +407,7 @@ jobs:
           ls -la *.apk
           echo
           echo "BIN:"
-          ls -la telemt-aarch64-musl
+          ls -la "${AARCH64_OUT_BIN}" "${X86_64_OUT_BIN}"
 
       - name: Fetch upstream release notes
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
@@ -262,10 +417,9 @@ jobs:
         run: |
           set -euxo pipefail
 
-          TAG="${{ env.VERSION }}"
           mkdir -p .release
 
-          if gh release view "$TAG" -R telemt/telemt --json body,name >/tmp/upstream_release.json 2>/dev/null; then
+          if gh release view "${TAG}" -R "${UPSTREAM_REPO}" --json body,name >/tmp/upstream_release.json 2>/dev/null; then
             jq -r '.body // ""' /tmp/upstream_release.json > .release/body.txt
             jq -r '.name // ""' /tmp/upstream_release.json > .release/upstream_name.txt
           else
@@ -273,7 +427,7 @@ jobs:
             printf '' > .release/upstream_name.txt
           fi
 
-      - name: Create or update GitHub Release from upstream notes
+      - name: Create or update GitHub Release
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -281,24 +435,25 @@ jobs:
         run: |
           set -euxo pipefail
 
-          TAG="${{ env.VERSION }}"
           TITLE="Release ${TAG}"
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release edit "$TAG" \
-              --title "$TITLE" \
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" \
+              --title "${TITLE}" \
               --notes-file .release/body.txt
 
-            gh release upload "$TAG" \
-              telemt-aarch64-musl \
+            gh release upload "${TAG}" \
+              "${AARCH64_OUT_BIN}" \
+              "${X86_64_OUT_BIN}" \
               *.ipk \
               *.apk \
               --clobber
           else
-            gh release create "$TAG" \
-              telemt-aarch64-musl \
+            gh release create "${TAG}" \
+              "${AARCH64_OUT_BIN}" \
+              "${X86_64_OUT_BIN}" \
               *.ipk \
               *.apk \
-              --title "$TITLE" \
+              --title "${TITLE}" \
               --notes-file .release/body.txt
           fi

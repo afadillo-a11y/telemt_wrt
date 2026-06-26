@@ -3,14 +3,14 @@ name: Build and Release Headless Telemt (aarch64 build + x86_64 upstream)
 on:
   push:
     tags:
-      - '3.3.*'
+      - '3.*'
       - '[4-9]*'
   workflow_dispatch:
     inputs:
       build_target:
-        description: 'Enter tag (e.g. 3.3.35) or branch (main)'
+        description: 'Enter tag (e.g. 3.4.0) or branch (main)'
         required: true
-        default: '3.3.35'
+        default: '3.4.0'
 
 jobs:
   release:
